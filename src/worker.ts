@@ -498,7 +498,14 @@ const BAR_JS = `(function (d) {
       '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="' + path + '"/></svg></a>';
   };
   var when = new Date(d.at).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
-  var dead = false, fresh = false, tries = 0, ws = null, host, root;
+  var dead = false, fresh = false, news = false, tries = 0, ws = null, host, root;
+  if (!d.pinned) {
+    try {
+      var seen = Number(localStorage.getItem("tack:seen:" + d.slug)) || 0;
+      news = seen > 0 && seen < d.latest;
+      localStorage.setItem("tack:seen:" + d.slug, String(d.latest));
+    } catch (_) {}
+  }
   var render = function () {
     if (d.count < 2 && !fresh) return;
     if (!host) {
@@ -517,9 +524,10 @@ const BAR_JS = `(function (d) {
       "a:hover{background:rgba(255,255,255,.1)}a:focus-visible{outline:2px solid #60a5fa}" +
       ".v{padding:0 6px}.v span{color:#8a8a8a}.old .v b{color:#fbbf24}b{font-weight:500}" +
       ".nw{padding:0 6px;color:#4ade80;font-weight:600}" +
-      ".ar,.ch{opacity:0;overflow:hidden;color:#a3a3a3;transition:max-width .2s,width .2s,opacity .2s,padding .2s}" +
-      ".ar{width:0}.ch{max-width:0}.ar:hover,.ch:hover{color:#fff}" +
+      ".ar,.ch,.age{opacity:0;overflow:hidden;color:#a3a3a3;transition:max-width .2s,width .2s,opacity .2s,padding .2s}" +
+      ".ar{width:0}.ch,.age{max-width:0}.age{display:inline-block;vertical-align:top;white-space:nowrap}.ar:hover,.ch:hover{color:#fff}" +
       "nav:hover .ar,nav:focus-within .ar{width:20px;opacity:1}nav:hover .ch,nav:focus-within .ch{max-width:72px;padding:0 6px;opacity:1}" +
+      "nav:hover .age,nav:focus-within .age,.v .age.up{max-width:160px;opacity:1}.v .age.up{color:#86efac}" +
       "@media (hover:none){.ar{width:20px;opacity:1}.ch{max-width:72px;padding:0 6px;opacity:1}}" +
       "svg{width:14px;height:14px;flex:none;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}" +
       "@media print{:host{display:none}}" +
@@ -527,7 +535,8 @@ const BAR_JS = `(function (d) {
       '<nav class="' + (d.n < d.latest ? "old" : "") + '" aria-label="Versions">' +
       arrow(d.prev, "Previous version", "m15 18-6-6 6-6") +
       '<a class="v" href="' + e(base + "_history") + '" title="' + e("v" + d.n + " · " + when + (d.note ? " · " + d.note : "")) + '">' +
-      "<b>v" + d.n + "</b><span>&thinsp;" + (d.n < d.latest ? "/&thinsp;" + d.latest : "·&thinsp;" + ago(d.at)) + "</span></a>" +
+      "<b>v" + d.n + "</b><span>&thinsp;/&thinsp;" + d.latest + "</span>" +
+      '<span class="age' + (news ? " up" : "") + '">&thinsp;·&thinsp;' + (news ? "updated " : "") + ago(d.at) + "</span></a>" +
       arrow(d.next, "Next version", "m9 18 6-6-6-6") +
       (d.prev ? '<a class="ch" href="' + e(base + "_diff?a=" + d.prev + "&b=" + d.n) + '" title="What changed in v' + d.n + '">changes</a>' : "") +
       (fresh && d.latest > d.n ? '<a class="nw" href="' + e(base + d.sub) + '" title="Open v' + d.latest + '">new</a>' : "") +
