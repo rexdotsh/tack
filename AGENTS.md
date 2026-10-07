@@ -15,7 +15,7 @@ tack: a private postplan.dev. A Cloudflare Worker + R2 bucket behind Cloudflare 
 bun install
 bun run check     # wrangler types + tsc for worker and cli
 bun run dev       # local worker with local R2 on :8787
-TACK_URL=http://localhost:8787 XDG_CONFIG_HOME=/tmp/tack-cfg bun cli/tack.ts upload x.html
+TACK_URL=http://localhost:8787 XDG_CONFIG_HOME=/tmp/tack-cfg ./cli/tack.ts upload x.html
 ```
 
 There are no automated tests. Verify changes against `bun run dev` with the CLI and curl.
@@ -35,3 +35,6 @@ There are no automated tests. Verify changes against `bun run dev` with the CLI 
 - R2 layout: `meta/<slug>.json` holds the title and the version list (`files` maps path → sha256), plus `customMetadata` so `/` needs one `list()`. File bytes live at `blobs/<slug>/<sha256>`. Versions are append-only and immutable; meta writes use conditional puts.
 - URL space: `/api/*` is the API, `/<slug>/` latest, `/<slug>/v/<n>/` pinned, `/<slug>/_history`. Slug `api` and file paths starting with `v/` or `_history` are reserved.
 - The version switcher is only injected for `Sec-Fetch-Dest: document` without `?raw`. API clients and `tack get` always get the exact bytes.
+- Workers Free allows 1,000 R2 calls per request, so uploads are capped at 200 files (worker and CLI). Use `Object.hasOwn` for lookups keyed by paths or extensions.
+- The CLI runs with `bun --no-env-file` so a project's `.env` can't redirect the service token. Folder uploads never follow symlinks.
+- Workers Builds needs the `BUN_VERSION` build variable (≥ 1.4) to read `bun.lock`.

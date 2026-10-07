@@ -13,7 +13,7 @@ Do these in order so the domain is never public.
 3. **Access app**: Zero Trust → Access controls → Applications → Add → Self-hosted, domain `tack.rex.wf`, with two policies:
    - `Allow`: include your email
    - `Service Auth`: include the `tack-cli` service token
-4. **Worker**: Workers & Pages → Create → Import a repository → this repo. Deploy command: `bunx wrangler deploy`. `wrangler.jsonc` attaches the `tack.rex.wf` custom domain and keeps `workers.dev` and preview URLs off (those would bypass Access).
+4. **Worker**: Workers & Pages → Create → Import a repository → this repo. Deploy command: `bunx wrangler deploy`. Under Settings → Build → Variables, set `BUN_VERSION` = `1.4.0` (the build image defaults to Bun 1.2, which can't read `bun.lock`). `wrangler.jsonc` attaches the `tack.rex.wf` custom domain and keeps `workers.dev` and preview URLs off (those would bypass Access).
 
 ## CLI
 
@@ -32,7 +32,7 @@ tack list
 tack rm q3-report
 ```
 
-Config lives in `~/.config/tack/config.json`. `TACK_URL`, `TACK_CLIENT_ID`, `TACK_CLIENT_SECRET` and `--url` override it.
+Config lives in `~/.config/tack/config.json`. `TACK_URL`, `TACK_CLIENT_ID`, `TACK_CLIENT_SECRET` and `--url` override it (`.env` files are ignored). Uploads are capped at 200 files and 30 MB; symlinks and dotfiles in folders are skipped.
 
 ## Agent skill
 
