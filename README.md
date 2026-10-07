@@ -1,64 +1,54 @@
 # tack
 
-Private HTML doc drops for agents. An agent runs `tack upload plan.html`, the page goes up on your own Cloudflare Worker, and it replies with a link. Re-uploads become new versions under the same link.
+Private HTML docs for agents, on your own Cloudflare.
 
-One Worker, one R2 bucket, one token. No database, no accounts, no content restrictions.
+An agent runs `tack upload plan.html` and replies with a link. Uploading again adds a version under the same link, and open tabs update live.
 
-Docs are secret links: anyone with a link can open it, and links carry a random part so they can't be guessed. Uploads and the doc list need the token.
+- **Secret links.** Anyone with a link can read it; nobody can guess one.
+- **Versions.** `/slug/` is the latest, `/slug/v/2/` is pinned, plus `/_history` and `/_diff`.
+- **Anything goes.** Served byte-for-byte: scripts, assets, multi-page folders.
+- **Free plan friendly.** One Worker, one R2 bucket, one Durable Object.
 
-## Deploy
+## Setup
 
-1. **R2**: create a bucket named `tack` (dashboard → R2, or `bunx wrangler r2 bucket create tack`).
-2. **Worker**: Workers & Pages → Create → Import a repository → this repo. Deploy command: `bunx wrangler deploy`. Under Settings → Build → Variables, set `BUN_VERSION` = `1.4.0` (the build image defaults to Bun 1.2, which can't read `bun.lock`). `wrangler.jsonc` attaches the `tack.rex.wf` custom domain and creates the Durable Object used for live updates.
-3. **Token + CLI**:
+1. Create an R2 bucket named `tack`.
+2. Workers & Pages → Import this repo. Deploy command `bunx wrangler deploy`, build variable `BUN_VERSION=1.4.0`. Set your domain in `wrangler.jsonc` and `DEFAULT_URL` in `cli/tack.ts`.
+3. Install the CLI and skill (running from the repo needs Node 22.18+):
 
-   ```sh
-   bun install
-   ln -s "$PWD/cli/tack.ts" ~/.bun/bin/tack
-   tack setup    # creates a token, sets it on the Worker via wrangler, saves it locally
-   tack open     # prints the link that unlocks the doc list in your browser
-   ```
+```sh
+bun install
+ln -s "$PWD/cli/tack.ts" ~/.local/bin/tack
+ln -s "$PWD/skill/tack" ~/.agents/skills/tack
+tack setup   # creates a token and sets it on the Worker
+tack open    # unlocks the doc list in your browser
+```
 
-   On another machine: `tack setup --token <token>` (the token is in `~/.config/tack/config.json`), or set `TACK_TOKEN`. If the token leaks, `tack setup --rotate` replaces it (and the unlock link).
+Any other machine with Node 20+ installs the CLI and skill from your instance:
+
+```sh
+curl -fsSL https://tack.rex.wf/install | sh
+tack setup --token <token>   # token is in ~/.config/tack/config.json on the first machine
+```
 
 ## CLI
 
-```sh
-tack upload plan.html                            # new doc, prints (and copies) the link
-tack upload plan.html --note "tightened scope"   # same path again: new version
-tack upload ./report/                            # folder with index.html + assets
-tack get <slug> --v 2                            # print the exact HTML
-tack open <slug>                                 # open in your browser
-tack list
-tack rm <slug> [--v 2]                           # delete a doc, or one version
-tack mv <slug> <new-slug>                        # rename (old links stop working)
+```
+tack upload <file|dir|-> [--new] [--slug s] [--note n] [--json]
+tack get <slug|url> [--v n]
+tack list [--match words] [--json]
+tack open [slug]
+tack rm <slug> [--v n]
+tack mv <slug> <new-slug>
+tack setup [--token t | --rotate]
+tack update
 ```
 
-A single `.html` file also brings along the local images, CSS and pages it references (from its own folder down). Re-uploads only send files that changed. Open docs update live over a WebSocket when a new version lands.
-
-`TACK_URL`, `TACK_TOKEN` and `--url` override the config (`.env` files are ignored). Uploads are capped at 200 files and 30 MB; symlinks and dotfiles in folders are skipped. A custom `--slug` makes the link guessable.
-
-## Agent skill
-
-```sh
-ln -s "$PWD/skill/tack" ~/.agents/skills/tack
-```
-
-## URLs
-
-| URL | |
-|---|---|
-| `/` | all docs (after `tack open`) |
-| `/<slug>/` | latest version |
-| `/<slug>/v/<n>/` | pinned version |
-| `/<slug>/_history` | versions with notes |
-| `/<slug>/_diff?a=1&b=2` | what changed between two versions |
-| `?raw` | exact uploaded bytes, without the version switcher |
-
-## Local dev
+## Dev
 
 ```sh
 echo 'TACK_TOKEN=dev' > .dev.vars
 bun run dev
 TACK_URL=http://localhost:8787 TACK_TOKEN=dev tack upload plan.html
 ```
+
+Internals and invariants are in [AGENTS.md](AGENTS.md).

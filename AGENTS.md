@@ -5,9 +5,9 @@ tack: a private postplan.dev. A Cloudflare Worker + R2 bucket serves versioned H
 ## Layout
 
 - `src/worker.ts`: the whole Worker (API, serving, index/history/diff pages, version chip) plus the `Live` Durable Object.
-- `cli/tack.ts`: the whole CLI. Runs directly with Bun, zero dependencies.
+- `cli/tack.ts`: the whole CLI, zero dependencies. Node built-ins only and erasable TypeScript only, so it runs as-is on Node 22.18+ (type stripping) and Bun, and `bun run build:cli` bundles it to `dist/cli` for Node 20+.
 - `skill/tack/SKILL.md`: skill that tells agents how to use the CLI.
-- `wrangler.jsonc`: Worker config. Deployed from the Cloudflare dashboard via GitHub, so this file is the source of truth on every push.
+- `wrangler.jsonc`: Worker config. Deployed from the Cloudflare dashboard via GitHub, so this file is the source of truth on every push. Its build step bundles the CLI and copies the skill and `cli/install.sh` into `dist/`, served as static assets at `/cli`, `/skill.md` and `/install` (free, no Worker invocation), so installs always match the deployed Worker. The installer saves the CLI as `~/.local/share/tack/tack.mjs` (the `.mjs` makes it ESM on every Node 20+, regardless of package.json scope) and links `~/.local/bin/tack` to it. `tack update` re-downloads the CLI and a downloaded skill through unique temp files, and refuses to touch anything inside a git checkout.
 
 ## Commands
 
@@ -21,9 +21,14 @@ TACK_URL=http://localhost:8787 TACK_TOKEN=dev XDG_CONFIG_HOME=/tmp/tack-cfg ./cl
 
 There are no automated tests. Verify changes against `bun run dev` with the CLI and curl. Never run `tack setup` without `--token` while testing: it sets the secret on the real Worker.
 
+## Slugs
+
+New docs get up to three meaningful words from the title (filler words dropped) plus 10 random base36 characters. The random part is what keeps links private; don't shorten it.
+
 ## Rules
 
-- Bun for everything: `bun`, `bunx`, `bun.lock`. No npm/npx/node.
+- Bun for repo tooling: `bun`, `bunx`, `bun.lock`. No npm/npx.
+- The CLI must not depend on Bun: no `Bun.*` APIs, no top-level await, no TypeScript-only runtime syntax (`cli/tsconfig.json` enforces `erasableSyntaxOnly`). Check changes with `node cli/tack.ts` and `bun run build:cli && node dist/cli`.
 - Keep it minimal. No frameworks, no runtime dependencies, no new Cloudflare resources unless unavoidable.
 - No comments unless the code would be misleading without one.
 - Conventional commits with short messages (`feat: ...`, `fix: ...`).
@@ -42,12 +47,12 @@ There are no automated tests. Verify changes against `bun run dev` with the CLI 
 - Uploads are content-addressed: the CLI POSTs `{ files: { path: sha256 }, size, ... }`; the Worker answers `428 { missing }` for hashes it doesn't have, the CLI PUTs those raw to `/api/docs/<slug>/blobs/<sha256>` (streamed into R2, which verifies the sha256), then POSTs again to commit. The Worker never decodes or hashes file bytes.
 - Blobs are only deleted with their doc (`tack rm <slug>`) or by a rename. Deleting a single version leaves its blobs in place, because a concurrent upload may be reusing them.
 - Doc delete and rename first set `meta.lock` (`{ reason, at }`); uploads, version deletes, deletes and renames refuse while it's younger than 5 minutes, so a crashed operation can't wedge a doc. Rename copies blobs 4 at a time and unlocks on any failure before the target is published. Delete removes blobs before the meta, so a new doc at that slug never sees half-deleted files.
-- URL space: `/api/*`, `/login`, `/robots.txt`, `/<slug>/` latest, `/<slug>/v/<n>/` pinned, `/<slug>/_history`, `/<slug>/_diff`, `/<slug>/_live` (WebSocket). Slugs `api` and `login`, and file paths starting with `v`, `_history`, `_diff` or `_live`, are reserved.
+- URL space: `/api/*`, `/login`, `/robots.txt`, `/<slug>/` latest, `/<slug>/v/<n>/` pinned, `/<slug>/_history`, `/<slug>/_diff`, `/<slug>/_live` (WebSocket). Slugs `api`, `login`, `cli` and `install`, and file paths starting with `v`, `_history`, `_diff` or `_live`, are reserved.
 - Version numbers are never reused: `meta.lastN` remembers the highest ever issued, so deleting a version can't make an old pinned URL show new content. Numbers can have gaps; use neighbours from `meta.versions`, never `n ± 1`.
-- `BAR_JS` is injected into HTML only for `Sec-Fetch-Dest: document` without `?raw`, so API clients and `tack get` always get the exact bytes. The visible chip only renders once a doc has more than one version. The ETag hashes `BAR_JS` and its data so script changes aren't hidden behind cached 304s. All its URLs are built from `location.origin`, never relative (a doc's `<base>` must not see the slug).
+- `BAR_JS` is injected into HTML only for `Sec-Fetch-Dest: document` without `?raw`, so API clients and `tack get` always get the exact bytes. The visible chip only renders once a doc has more than one version. At rest it reads `v3 / 3` (amber number on older versions); hover reveals ‹ ›, the version's age and a `changes` link to `_diff`. On the latest view it remembers the last version seen in `localStorage` under `tack:seen:<hash of slug>` (never the raw slug: docs share the origin, so their JS can read it) and, only when there's a newer one, shows `· updated 2h ago` for that visit. The ETag hashes `BAR_JS` and its data so script changes aren't hidden behind cached 304s. All its URLs are built from `location.origin`, never relative (a doc's `<base>` must not see the slug).
 - Live updates are pushed, never polled: one `Live` Durable Object per slug holds hibernatable WebSockets from open tabs (read-only; any client message closes the socket). `meta.rev` is an integer bumped on every committed change. `notify()` stores and broadcasts state: `update` ignores anything not newer than what's stored, `reset` overwrites (new doc, rename target), `end` broadcasts and clears storage (deleted doc, rename source). New sockets get the stored state on connect. Tabs act only on `rev` newer than the page's, so stale or reordered notifications can't cause reload loops. Tabs stop reconnecting after ~1 minute of failures and retry when they become visible.
 - Workers Free allows 1,000 R2 calls per request, so uploads are capped at 200 files (worker and CLI). Use `Object.hasOwn` for lookups keyed by paths or extensions.
-- The CLI runs with `bun --no-env-file` so a project's `.env` can't redirect the token. It only sends the token to its configured origin, which must be https (http only for localhost). Folder uploads never follow symlinks.
+- The CLI never loads `.env` files (Node doesn't by default; don't add dotenv), so a project's `.env` can't redirect the token. It only sends the token to its configured origin, which must be https (http only for localhost), and never follows a redirect to plain http. Running the CLI with plain `bun` would bring back `.env` autoloading; use `node` or `bun --no-env-file`. Folder uploads never follow symlinks.
 - Every response is `cache-control: ... no-transform`; without it Cloudflare's bot detection injects a script into HTML and docs stop being byte-for-byte.
 - Workers Builds needs the `BUN_VERSION` build variable (≥ 1.4) to read `bun.lock`.
 
