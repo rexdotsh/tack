@@ -1,26 +1,82 @@
+import { DurableObject } from "cloudflare:workers";
+
 interface Env {
   BUCKET: R2Bucket;
+  LIVE: DurableObjectNamespace<Live>;
   TACK_TOKEN?: string;
 }
 
 type Version = { n: number; at: string; hash: string; size: number; files: Record<string, string>; note?: string };
-type Meta = { slug: string; title: string; createdAt: string; updatedAt: string; lastN?: number; versions: Version[] };
+type Meta = {
+  slug: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  lastN?: number;
+  renamingTo?: string;
+  versions: Version[];
+};
 type DocSummary = { slug: string; title: string; updatedAt: string; latest: number; versions: number };
-type UploadBody = { files?: Record<string, unknown>; title?: string; note?: string; create?: boolean };
+type UploadBody = { files?: Record<string, unknown>; size?: number; title?: string; note?: string; create?: boolean };
+type LiveState = { rev: string; latest?: number; count?: number; moved?: string };
 
 const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const MAX_FILES = 200;
 const RESERVED_SLUGS = new Set(["api", "login"]);
-const RESERVED_PATHS = new Set(["v", "_history", "_latest", "_diff"]);
+const RESERVED_PATHS = new Set(["v", "_history", "_diff", "_live"]);
+const HASH_RE = /^[0-9a-f]{64}$/;
 const metaKey = (slug: string) => `meta/${slug}.json`;
 const blobKey = (slug: string, hash: string) => `blobs/${slug}/${hash}`;
 
+export class Live extends DurableObject<Env> {
+  async fetch(): Promise<Response> {
+    const [client, server] = Object.values(new WebSocketPair());
+    this.ctx.acceptWebSocket(server);
+    const state = await this.ctx.storage.get<string>("state");
+    if (state) server.send(state);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async notify(state: LiveState) {
+    const msg = JSON.stringify(state);
+    await this.ctx.storage.put("state", msg);
+    for (const ws of this.ctx.getWebSockets()) {
+      try {
+        ws.send(msg);
+      } catch {}
+    }
+  }
+
+  async clear() {
+    await this.ctx.storage.deleteAll();
+  }
+
+  webSocketMessage() {}
+
+  webSocketClose(ws: WebSocket, code: number) {
+    try {
+      ws.close(code);
+    } catch {}
+  }
+}
+
+const live = (env: Env, slug: string) => env.LIVE.get(env.LIVE.idFromName(slug));
+
+async function notify(env: Env, slug: string, state: LiveState) {
+  try {
+    await live(env, slug).notify(state);
+  } catch (err) {
+    console.error("live notify failed", err);
+  }
+}
+
 export default {
-  async fetch(req, env): Promise<Response> {
+  async fetch(req, env, ctx): Promise<Response> {
     const url = new URL(req.url);
     let res: Response;
     try {
-      res = await route(req, env, url);
+      res = await route(req, env, ctx, url);
+      if (res.webSocket) return res;
     } catch (err) {
       console.error(err);
       res = text(`tack: internal error: ${err instanceof Error ? err.message : String(err)}`, 500);
@@ -32,7 +88,7 @@ export default {
   },
 } satisfies ExportedHandler<Env>;
 
-async function route(req: Request, env: Env, url: URL): Promise<Response> {
+async function route(req: Request, env: Env, ctx: ExecutionContext, url: URL): Promise<Response> {
   if (url.pathname === "/robots.txt") return text("User-agent: *\nDisallow: /\n");
   if (url.pathname === "/login") return login(env, url);
   if (url.pathname === "/") return (await isViewer(req, env)) ? indexPage(env) : locked();
@@ -42,7 +98,7 @@ async function route(req: Request, env: Env, url: URL): Promise<Response> {
     if (!(await same(token, env.TACK_TOKEN))) return fail(401, "bad or missing token (run `tack setup`)");
     return api(req, env, url);
   }
-  return serveDoc(req, env, url);
+  return serveDoc(req, env, ctx, url);
 }
 
 async function viewKey(env: Env): Promise<string | null> {
@@ -75,11 +131,13 @@ async function same(given: string | null | undefined, expected: string): Promise
 }
 
 async function api(req: Request, env: Env, url: URL): Promise<Response> {
-  const m = url.pathname.match(/^\/api\/docs(?:\/([^/]+)(?:\/(rename|v\/\d+))?)?\/?$/);
+  const m = url.pathname.match(/^\/api\/docs(?:\/([^/]+)(?:\/(rename|v\/\d+|blobs\/[0-9a-f]{64}))?)?\/?$/);
   if (!m) return fail(404, "not found");
   const [, slug, sub] = m;
-  if (sub === "rename") return req.method === "POST" ? rename(req, env, url.origin, slug) : fail(405, "method not allowed");
-  if (sub) return req.method === "DELETE" ? removeVersion(env, slug, Number(sub.slice(2))) : fail(405, "method not allowed");
+  const allow = (method: string, run: () => Promise<Response>) => (req.method === method ? run() : fail(405, "method not allowed"));
+  if (sub === "rename") return allow("POST", () => rename(req, env, url.origin, slug));
+  if (sub?.startsWith("v/")) return allow("DELETE", () => removeVersion(env, slug, Number(sub.slice(2))));
+  if (sub) return allow("PUT", () => putBlob(req, env, slug, sub.slice(6)));
 
   if (!slug) {
     if (req.method !== "GET") return fail(405, "method not allowed");
@@ -96,41 +154,36 @@ async function api(req: Request, env: Env, url: URL): Promise<Response> {
   return fail(405, "method not allowed");
 }
 
+async function putBlob(req: Request, env: Env, slug: string, hash: string): Promise<Response> {
+  if (!SLUG_RE.test(slug)) return fail(400, "bad slug");
+  const length = Number(req.headers.get("content-length"));
+  const body = length > 0 && req.body ? req.body : await req.arrayBuffer();
+  try {
+    await env.BUCKET.put(blobKey(slug, hash), body, { sha256: hash });
+  } catch {
+    return fail(400, "file contents don't match their hash");
+  }
+  return json({ ok: true });
+}
+
 async function upload(req: Request, env: Env, origin: string, slug: string): Promise<Response> {
   if (!SLUG_RE.test(slug) || RESERVED_SLUGS.has(slug)) {
     return fail(400, "slug must be 1-64 chars of a-z, 0-9 and '-' (not starting/ending with '-'), and not 'api' or 'login'");
   }
   const body = await req.json<UploadBody>().catch(() => null);
-  if (!body?.files || typeof body.files !== "object") return fail(400, "expected JSON { files: { path: base64 } }");
+  if (!body?.files || typeof body.files !== "object") return fail(400, "expected JSON { files: { path: sha256 } }");
   const entries = Object.entries(body.files);
   if (entries.length > MAX_FILES) return fail(413, `an upload can have at most ${MAX_FILES} files`);
 
   const files: Record<string, string> = Object.create(null);
-  const blobs = new Map<string, Uint8Array>();
-  let size = 0;
-  for (const [raw, b64] of entries) {
+  for (const [raw, hash] of entries) {
     const path = cleanPath(raw);
-    if (!path) return fail(400, `bad file path "${raw}" (no '..', and the first segment can't be v, _history, _latest or _diff)`);
-    if (typeof b64 !== "string") return fail(400, `file "${raw}" must be a base64 string`);
-    let bytes: Uint8Array;
-    try {
-      bytes = Uint8Array.fromBase64(b64);
-    } catch {
-      return fail(400, `file "${raw}" is not valid base64`);
-    }
-    const hash = await sha256(bytes);
+    if (!path) return fail(400, `bad file path "${raw}" (no '..', and the first segment can't be v, _history, _diff or _live)`);
+    if (typeof hash !== "string" || !HASH_RE.test(hash)) return fail(400, `file "${raw}" needs a lowercase hex sha256`);
     files[path] = hash;
-    blobs.set(hash, bytes);
-    size += bytes.byteLength;
   }
   if (!Object.hasOwn(files, "index.html")) return fail(400, "an upload needs an index.html");
-
-  await Promise.all(
-    [...blobs].map(async ([hash, bytes]) => {
-      const key = blobKey(slug, hash);
-      if (!(await env.BUCKET.head(key))) await env.BUCKET.put(key, bytes);
-    }),
-  );
+  const size = Math.max(0, Math.floor(Number(body.size) || 0));
 
   const versionHash = await sha256(
     new TextEncoder().encode(Object.keys(files).sort().map((p) => `${p}\0${files[p]}`).join("\n")),
@@ -145,9 +198,16 @@ async function upload(req: Request, env: Env, origin: string, slug: string): Pro
     const meta: Meta = existing
       ? await existing.json<Meta>()
       : { slug, title: slug, createdAt: now, updatedAt: now, versions: [] };
+    if (meta.renamingTo) return fail(409, `${slug} is being renamed to ${meta.renamingTo}; retry against the new slug`);
 
     const latest = meta.versions.at(-1);
     if (latest && latest.hash === versionHash) return json(receipt(origin, meta, latest, true));
+
+    const known = new Set(meta.versions.flatMap((v) => Object.values(v.files)));
+    const fresh = [...new Set(Object.values(files))].filter((h) => !known.has(h));
+    const present = await Promise.all(fresh.map((h) => env.BUCKET.head(blobKey(slug, h))));
+    const missing = fresh.filter((_, i) => !present[i]);
+    if (missing.length) return json({ ok: false, error: "upload these files first", missing }, 428);
 
     const version: Version = { n: Math.max(meta.lastN ?? 0, latest?.n ?? 0) + 1, at: now, hash: versionHash, size, files };
     if (note) version.note = note;
@@ -156,14 +216,11 @@ async function upload(req: Request, env: Env, origin: string, slug: string): Pro
     meta.title = title || meta.title;
     meta.updatedAt = now;
 
-    let saved: R2Object | null;
-    try {
-      saved = await saveMeta(env, meta, existing ? { etagMatches: existing.etag } : new Headers({ "if-none-match": "*" }));
-    } catch {
-      await new Promise((r) => setTimeout(r, 1000));
-      continue;
+    const saved = await saveMeta(env, meta, existing ? { etagMatches: existing.etag } : new Headers({ "if-none-match": "*" }));
+    if (saved) {
+      await notify(env, slug, { rev: now, latest: version.n, count: meta.versions.length });
+      return json(receipt(origin, meta, version, false), existing ? 200 : 201);
     }
-    if (saved) return json(receipt(origin, meta, version, false), existing ? 200 : 201);
     if (body.create) return fail(409, `slug "${slug}" is already taken`);
   }
   return fail(503, "too many concurrent uploads to this slug; retry");
@@ -184,23 +241,31 @@ function receipt(origin: string, meta: Meta, v: Version, unchanged: boolean) {
   };
 }
 
-function saveMeta(env: Env, meta: Meta, onlyIf: R2Conditional | Headers): Promise<R2Object | null> {
-  return env.BUCKET.put(metaKey(meta.slug), JSON.stringify(meta), {
-    onlyIf,
-    httpMetadata: { contentType: "application/json" },
-    customMetadata: {
-      title: encodeURIComponent(meta.title.slice(0, 120).toWellFormed()),
-      updatedAt: meta.updatedAt,
-      latest: String(meta.versions.at(-1)!.n),
-      versions: String(meta.versions.length),
-    },
-  });
+async function saveMeta(env: Env, meta: Meta, onlyIf: R2Conditional | Headers): Promise<R2Object | null> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await env.BUCKET.put(metaKey(meta.slug), JSON.stringify(meta), {
+        onlyIf,
+        httpMetadata: { contentType: "application/json" },
+        customMetadata: {
+          title: encodeURIComponent(meta.title.slice(0, 120).toWellFormed()),
+          updatedAt: meta.updatedAt,
+          latest: String(meta.versions.at(-1)!.n),
+          versions: String(meta.versions.length),
+        },
+      });
+    } catch (err) {
+      if (attempt >= 3) throw err;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
 }
 
 async function remove(env: Env, slug: string): Promise<Response> {
   if (!SLUG_RE.test(slug) || !(await env.BUCKET.head(metaKey(slug)))) return fail(404, `no doc called "${slug}"`);
   await env.BUCKET.delete(metaKey(slug));
   await deleteBlobs(env, slug);
+  await live(env, slug).clear().catch(() => {});
   return json({ ok: true, slug, deleted: true });
 }
 
@@ -218,16 +283,17 @@ async function removeVersion(env: Env, slug: string, n: number): Promise<Respons
     const obj = SLUG_RE.test(slug) ? await env.BUCKET.get(metaKey(slug)) : null;
     if (!obj) return fail(404, `no doc called "${slug}"`);
     const meta = await obj.json<Meta>();
+    if (meta.renamingTo) return fail(409, `${slug} is being renamed to ${meta.renamingTo}`);
     const i = meta.versions.findIndex((v) => v.n === n);
     if (i < 0) return fail(404, `${slug} has no version ${n}`);
     if (meta.versions.length === 1) return fail(400, `v${n} is the only version; use \`tack rm ${slug}\` to delete the doc`);
     const [gone] = meta.versions.splice(i, 1);
     meta.lastN = Math.max(meta.lastN ?? 0, gone.n);
-    if (!(await saveMeta(env, meta, { etagMatches: obj.etag }))) continue;
-    const kept = new Set(meta.versions.flatMap((v) => Object.values(v.files)));
-    const orphans = [...new Set(Object.values(gone.files))].filter((h) => !kept.has(h));
-    if (orphans.length) await env.BUCKET.delete(orphans.map((h) => blobKey(slug, h)));
-    return json({ ok: true, slug, deleted: n, latest: meta.versions.at(-1)!.n });
+    meta.updatedAt = new Date().toISOString();
+    if (await saveMeta(env, meta, { etagMatches: obj.etag })) {
+      await notify(env, slug, { rev: meta.updatedAt, latest: meta.versions.at(-1)!.n, count: meta.versions.length });
+      return json({ ok: true, slug, deleted: n, latest: meta.versions.at(-1)!.n });
+    }
   }
   return fail(503, "too many concurrent changes to this doc; retry");
 }
@@ -239,18 +305,33 @@ async function rename(req: Request, env: Env, origin: string, slug: string): Pro
   if (!obj) return fail(404, `no doc called "${slug}"`);
   if (await env.BUCKET.head(metaKey(to))) return fail(409, `slug "${to}" is already taken`);
   const meta = await obj.json<Meta>();
+  if (meta.renamingTo) return fail(409, `${slug} is already being renamed to ${meta.renamingTo}`);
   const hashes = [...new Set(meta.versions.flatMap((v) => Object.values(v.files)))];
   if (hashes.length > MAX_FILES * 2) return fail(413, `${slug} has too many files to rename`);
-  await Promise.all(
-    hashes.map(async (h) => {
-      const blob = await env.BUCKET.get(blobKey(slug, h));
-      if (blob) await env.BUCKET.put(blobKey(to, h), await blob.arrayBuffer());
-    }),
-  );
-  meta.slug = to;
-  if (!(await saveMeta(env, meta, new Headers({ "if-none-match": "*" })))) return fail(409, `slug "${to}" is already taken`);
+
+  const locked = await saveMeta(env, { ...meta, renamingTo: to }, { etagMatches: obj.etag });
+  if (!locked) return fail(409, `${slug} changed while renaming; retry`);
+  const unlock = async (status: number, error: string) => {
+    await saveMeta(env, meta, { etagMatches: locked.etag });
+    return fail(status, error);
+  };
+
+  for (let i = 0; i < hashes.length; i += 4) {
+    const batch = await Promise.all(
+      hashes.slice(i, i + 4).map(async (h) => {
+        const blob = await env.BUCKET.get(blobKey(slug, h));
+        if (blob) await env.BUCKET.put(blobKey(to, h), await blob.arrayBuffer());
+        return Boolean(blob);
+      }),
+    );
+    if (batch.includes(false)) return unlock(500, `${slug} is missing stored files; not renamed`);
+  }
+  if (!(await saveMeta(env, { ...meta, slug: to }, new Headers({ "if-none-match": "*" })))) {
+    return unlock(409, `slug "${to}" is already taken`);
+  }
   await env.BUCKET.delete(metaKey(slug));
   await deleteBlobs(env, slug);
+  await notify(env, slug, { rev: new Date().toISOString(), moved: to });
   return json({ ok: true, from: slug, slug: to, url: `${origin}/${to}/` });
 }
 
@@ -285,21 +366,21 @@ async function listDocs(env: Env): Promise<DocSummary[]> {
   return docs.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
-async function serveDoc(req: Request, env: Env, url: URL): Promise<Response> {
+async function serveDoc(req: Request, env: Env, ctx: ExecutionContext, url: URL): Promise<Response> {
   const [, slug, rest] = url.pathname.match(/^\/([^/]+)(\/.*)?$/) ?? [];
   if (!slug || !SLUG_RE.test(slug)) return notFound();
   if (rest === undefined) return redirect(`/${slug}/${url.search}`);
-  if (rest === "/_latest") {
-    const head = await env.BUCKET.head(metaKey(slug));
-    if (!head) return fail(404, "not found");
-    return Response.json({ latest: Number(head.customMetadata?.latest ?? 0) }, { headers: { "cache-control": "no-store" } });
+  if (rest === "/_live") {
+    if (req.headers.get("upgrade") !== "websocket") return fail(426, "expected a websocket");
+    if (!(await env.BUCKET.head(metaKey(slug)))) return fail(404, "not found");
+    return live(env, slug).fetch(req);
   }
   const meta = await getMeta(env, slug);
   if (!meta) return notFound(`No doc called “${slug}”.`);
 
   let sub = rest.slice(1);
   if (sub === "_history") return html(historyPage(meta));
-  if (sub === "_diff") return diffPage(env, meta, url);
+  if (sub === "_diff") return diffPage(env, ctx, meta, url);
 
   const latestN = meta.versions.at(-1)!.n;
   let version = meta.versions.at(-1)!;
@@ -344,6 +425,7 @@ async function serveDoc(req: Request, env: Env, url: URL): Promise<Response> {
     sub,
     at: version.at,
     note: version.note ?? "",
+    rev: meta.updatedAt,
   };
   const etag = `"${hash.slice(0, 32)}${inject ? `-${hash36(BAR_JS + JSON.stringify(bar))}` : ""}"`;
   const headers = new Headers({
@@ -357,15 +439,26 @@ async function serveDoc(req: Request, env: Env, url: URL): Promise<Response> {
   });
   if (req.headers.get("if-none-match") === etag) return new Response(null, { status: 304, headers });
 
-  const obj = await env.BUCKET.get(blobKey(slug, hash));
-  if (!obj) return notFound(`Missing blob for ${slug} v${version.n} “${path}”.`, slug);
-  const res = new Response(obj.body, { headers });
+  const body = await readBlob(env, ctx, slug, hash);
+  if (!body) return notFound(`Missing blob for ${slug} v${version.n} “${path}”.`, slug);
+  const res = new Response(body, { headers });
   return inject ? withVersionBar(res, bar) : res;
+}
+
+async function readBlob(env: Env, ctx: ExecutionContext, slug: string, hash: string): Promise<ReadableStream | null> {
+  const key = new Request(`https://blob.tack/${slug}/${hash}`);
+  const hit = await caches.default.match(key);
+  if (hit?.body) return hit.body;
+  const obj = await env.BUCKET.get(blobKey(slug, hash));
+  if (!obj) return null;
+  const [mine, cached] = obj.body.tee();
+  ctx.waitUntil(caches.default.put(key, new Response(cached, { headers: { "cache-control": "public, max-age=31536000, immutable" } })));
+  return mine;
 }
 
 const BAR_JS = `(function (d) {
   var e = function (s) { return String(s).replace(/[&"'<>]/g, function (c) { return "&#" + c.charCodeAt(0) + ";"; }); };
-  var base = "/" + d.slug + "/";
+  var base = location.origin + "/" + d.slug + "/";
   var href = function (n) { return n === d.latest ? base + d.sub : base + "v/" + n + "/" + d.sub; };
   var arrow = function (n, label, path) {
     if (!n) return "";
@@ -406,26 +499,20 @@ const BAR_JS = `(function (d) {
       "</nav>";
   };
   render(false);
-  var delay = 3000, timer;
-  var check = function () {
-    clearTimeout(timer);
-    if (document.visibilityState !== "visible") return;
-    fetch(base + "_latest", { cache: "no-store" })
-      .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (j) {
-        if (j && j.latest > d.latest) {
-          if (!d.pinned) return location.reload();
-          if (!d.next) d.next = j.latest;
-          d.latest = j.latest;
-          render(true);
-        }
-        timer = setTimeout(check, (delay = Math.min(delay * 1.3, 30000)));
-      }, function () { timer = setTimeout(check, (delay = Math.min(delay * 2, 60000))); });
+  var sync = function (s) {
+    if (!s || !(s.rev > d.rev)) return;
+    if (s.moved) return location.replace(location.origin + "/" + s.moved + "/" + (d.pinned ? "v/" + d.n + "/" : "") + d.sub);
+    if (!d.pinned) return location.reload();
+    if (s.latest > d.latest) { d.latest = s.latest; d.rev = s.rev; render(true); }
   };
-  document.addEventListener("visibilitychange", function () {
-    if (document.visibilityState === "visible") { delay = 3000; check(); }
-  });
-  timer = setTimeout(check, delay);
+  var tries = 0;
+  var connect = function () {
+    var ws = new WebSocket(base.replace(/^http/, "ws") + "_live");
+    ws.onopen = function () { tries = 0; };
+    ws.onmessage = function (m) { try { sync(JSON.parse(m.data)); } catch (_) {} };
+    ws.onclose = function () { setTimeout(connect, Math.min(60000, 1000 * Math.pow(2, tries++))); };
+  };
+  connect();
 })(__DATA__);`;
 type BarData = {
   slug: string;
@@ -438,6 +525,7 @@ type BarData = {
   sub: string;
   at: string;
   note: string;
+  rev: string;
 };
 
 function withVersionBar(res: Response, data: BarData): Response {
@@ -541,20 +629,13 @@ function historyPage(meta: Meta): string {
   );
 }
 
-async function diffPage(env: Env, meta: Meta, url: URL): Promise<Response> {
+async function diffPage(env: Env, ctx: ExecutionContext, meta: Meta, url: URL): Promise<Response> {
   const pick = (n: string | null) => meta.versions.find((v) => v.n === Number(n));
   const b = pick(url.searchParams.get("b")) ?? meta.versions.at(-1)!;
   const a = pick(url.searchParams.get("a")) ?? meta.versions[Math.max(0, meta.versions.indexOf(b) - 1)];
   const path = url.searchParams.get("path") || "index.html";
-  const read = async (v: Version) => {
-    if (!Object.hasOwn(v.files, path)) return "";
-    const obj = await env.BUCKET.get(blobKey(meta.slug, v.files[path]));
-    return obj ? obj.text() : "";
-  };
-  const [before, after] = await Promise.all([read(a), read(b)]);
-  const ops = diff(textLines(before), textLines(after));
-  const added = ops.filter(([o]) => o === 1).length;
-  const removed = ops.filter(([o]) => o === -1).length;
+  const [ha, hb] = [a, b].map((v) => (Object.hasOwn(v.files, path) ? v.files[path] : ""));
+  const result = ha === hb ? { added: 0, removed: 0, html: "" } : await cachedDiff(env, ctx, meta.slug, ha, hb);
 
   const files = [...new Set([...Object.keys(a.files), ...Object.keys(b.files)])].sort().flatMap((p) => {
     const [x, y] = [a, b].map((v) => (Object.hasOwn(v.files, p) ? v.files[p] : ""));
@@ -566,6 +647,8 @@ async function diffPage(env: Env, meta: Meta, url: URL): Promise<Response> {
   const options = (sel: Version) =>
     meta.versions.map((v) => `<option value="${v.n}"${v === sel ? " selected" : ""}>v${v.n}</option>`).join("");
   const slug = meta.slug;
+  const subpath = path === "index.html" ? "" : path.split("/").map(encodeURIComponent).join("/");
+  const { added, removed } = result;
 
   return html(
     page(
@@ -573,12 +656,33 @@ async function diffPage(env: Env, meta: Meta, url: URL): Promise<Response> {
       `<p class="crumb m"><a href="/">tack</a> / <a href="/${slug}/_history">${slug}</a></p><h1>What changed</h1>` +
         `<form class="cmp m"><select name="a" aria-label="From">${options(a)}</select>→<select name="b" aria-label="To">${options(b)}</select>` +
         `${path === "index.html" ? "" : `<input type="hidden" name="path" value="${esc(path)}">`}<button>Compare</button>` +
-        `<span>· <a href="/${slug}/v/${a.n}/">open v${a.n}</a> · <a href="/${slug}/v/${b.n}/">open v${b.n}</a></span></form>` +
+        `<span>· <a href="/${slug}/v/${a.n}/${subpath}">open v${a.n}</a> · <a href="/${slug}/v/${b.n}/${subpath}">open v${b.n}</a></span></form>` +
         `<div class="m">${added || removed ? `+${added} −${removed} lines` : "No text changes"}${path === "index.html" ? "" : ` in ${esc(path)}`}</div>` +
         (multi && files.length ? `<div class="m">Files: ${files.join(" · ")}</div>` : "") +
-        (added || removed ? `<div class="diff">${renderDiff(ops)}</div>` : ""),
+        (added || removed ? `<div class="diff">${result.html}</div>` : ""),
     ),
   );
+}
+
+type DiffResult = { added: number; removed: number; html: string };
+
+async function cachedDiff(env: Env, ctx: ExecutionContext, slug: string, ha: string, hb: string): Promise<DiffResult> {
+  const key = new Request(`https://diff.tack/${ha || "none"}/${hb || "none"}`);
+  const hit = await caches.default.match(key);
+  if (hit) return hit.json<DiffResult>();
+  const read = async (hash: string) => {
+    const obj = hash ? await env.BUCKET.get(blobKey(slug, hash)) : null;
+    return obj ? (await obj.text()).slice(0, 400_000) : "";
+  };
+  const [before, after] = await Promise.all([read(ha), read(hb)]);
+  const ops = diff(textLines(before), textLines(after));
+  const result = {
+    added: ops.filter(([o]) => o === 1).length,
+    removed: ops.filter(([o]) => o === -1).length,
+    html: renderDiff(ops),
+  };
+  ctx.waitUntil(caches.default.put(key, Response.json(result, { headers: { "cache-control": "public, max-age=31536000, immutable" } })));
+  return result;
 }
 
 type Op = [-1 | 0 | 1, string];
@@ -590,7 +694,7 @@ function diff(a: string[], b: string[]): Op[] {
   const v = new Int32Array(2 * off + 2);
   const trace: Int32Array[] = [];
   search: for (let d = 0; d <= n + m; d++) {
-    if (d > 600) return [...a.map((t): Op => [-1, t]), ...b.map((t): Op => [1, t])];
+    if (d > 400) return [...a.map((t): Op => [-1, t]), ...b.map((t): Op => [1, t])];
     trace.push(v.slice(off - d - 1, off + d + 2));
     for (let k = -d; k <= d; k += 2) {
       let x = k === -d || (k !== d && v[off + k - 1] < v[off + k + 1]) ? v[off + k + 1] : v[off + k - 1] + 1;
@@ -623,6 +727,7 @@ function diff(a: string[], b: string[]): Op[] {
 
 function renderDiff(ops: Op[]): string {
   const ctx = 2;
+  let budget = 20_000;
   const out: string[] = [];
   const row = (cls: string, body: string) => out.push(`<div class="${cls}">${body}</div>`);
   for (let i = 0; i < ops.length; ) {
@@ -641,36 +746,57 @@ function renderDiff(ops: Op[]): string {
     } else {
       const dels = ops.slice(i, j).filter(([o]) => o === -1).map(([, t]) => t);
       const ins = ops.slice(i, j).filter(([o]) => o === 1).map(([, t]) => t);
-      dels.forEach((t, k) => row("del", k < ins.length ? inline(t, ins[k], -1) : esc(t)));
-      ins.forEach((t, k) => row("ins", k < dels.length ? inline(dels[k], t, 1) : esc(t)));
+      const pairs = dels.map((t, k) => {
+        if (k >= ins.length) return null;
+        const [from, to] = [t.split(/(\s+)/), ins[k].split(/(\s+)/)];
+        budget -= from.length + to.length;
+        return budget > 0 && from.length + to.length < 600 ? words(from, to) : null;
+      });
+      dels.forEach((t, k) => row("del", pairs[k]?.[0] ?? esc(t)));
+      ins.forEach((t, k) => row("ins", pairs[k]?.[1] ?? esc(t)));
     }
     i = j;
   }
   return out.join("");
 }
 
-function inline(from: string, to: string, side: -1 | 1): string {
-  const tag = side === -1 ? "del" : "ins";
-  return diff(from.split(/(\s+)/), to.split(/(\s+)/))
-    .filter(([o]) => o !== -side)
-    .map(([o, t]) => (o === side ? `<${tag}>${esc(t)}</${tag}>` : esc(t)))
-    .join("")
-    .replaceAll(`</${tag}><${tag}>`, "");
+function words(from: string[], to: string[]): [string, string] {
+  const ops = diff(from, to);
+  const side = (keep: -1 | 1, tag: string) =>
+    ops
+      .filter(([o]) => o !== -keep)
+      .map(([o, t]) => (o === keep ? `<${tag}>${esc(t)}</${tag}>` : esc(t)))
+      .join("")
+      .replaceAll(`</${tag}><${tag}>`, "");
+  return [side(-1, "del"), side(1, "ins")];
 }
 
 const BLOCK_TAGS =
-  /<\/?(?:p|div|h[1-6]|li|ul|ol|dl|dt|dd|tr|td|th|table|thead|tbody|section|article|header|footer|main|nav|aside|blockquote|pre|figure|figcaption|details|summary|caption|br|hr)\b[^>]*>/gi;
+  /<\/?(?:p|div|h[1-6]|li|ul|ol|dl|dt|dd|tr|td|th|table|thead|tbody|section|article|header|footer|main|nav|aside|blockquote|pre|figure|figcaption|details|summary|caption|br|hr)\b[^<>]*>/gi;
 
 function textLines(html: string): string[] {
-  const text = html
-    .replace(/<!--[\s\S]*?-->/g, "")
-    .replace(/<(script|style|head|template|svg|noscript)\b[\s\S]*?<\/\1\s*>/gi, "\n")
-    .replace(BLOCK_TAGS, "\n")
-    .replace(/<[^>]*>/g, "");
-  return decodeEntities(text)
+  const [first, ...rest] = html.split("<!--");
+  const uncommented = first + rest.map((p) => (p.includes("-->") ? p.slice(p.indexOf("-->") + 3) : "")).join("");
+  return decodeEntities(stripHidden(uncommented).replace(BLOCK_TAGS, "\n").replace(/<[^<>]*>/g, ""))
     .split("\n")
     .map((l) => l.replace(/\s+/g, " ").trim())
-    .filter(Boolean);
+    .filter(Boolean)
+    .slice(0, 5000);
+}
+
+function stripHidden(html: string): string {
+  const lower = html.toLowerCase();
+  const open = /<(script|style|head|template|svg|noscript)\b/g;
+  let out = "";
+  let last = 0;
+  for (let m; (m = open.exec(lower)); ) {
+    out += `${html.slice(last, m.index)}\n`;
+    const close = lower.indexOf(`</${m[1]}`, open.lastIndex);
+    if (close < 0) return out;
+    last = lower.indexOf(">", close) + 1 || lower.length;
+    open.lastIndex = last;
+  }
+  return out + html.slice(last);
 }
 
 const ENTITIES: Record<string, string> = {

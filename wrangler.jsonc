@@ -8,5 +8,8 @@
   "preview_urls": false,
   "routes": [{ "pattern": "tack.rex.wf", "custom_domain": true }],
 
-  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "tack" }]
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "tack" }],
+
+  "durable_objects": { "bindings": [{ "name": "LIVE", "class_name": "Live" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Live"] }]
 }
