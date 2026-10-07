@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { chmod, lstat, mkdir, readdir, readFile, realpath, rename, rm as removeFile, stat, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { chmod, lstat, mkdir, open as openFile, readdir, readFile, realpath, rename, rm as removeFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -139,8 +140,10 @@ async function upload(argv: string[]) {
   }
 
   if (!stdin) {
-    await mkdir(path.dirname(mapFile), { recursive: true });
-    await writeFile(mapFile, `${receipt.slug}\n${cfg.url}\n`);
+    await mkdir(path.dirname(mapFile), { recursive: true, mode: 0o700 });
+    await chmod(path.dirname(mapFile), 0o700);
+    await writeFile(mapFile, `${receipt.slug}\n${cfg.url}\n`, { mode: 0o600 });
+    await chmod(mapFile, 0o600);
   }
 
   const updateCommand = `tack upload ${stdin ? "-" : shellQuote(abs)} --slug ${receipt.slug}`;
@@ -238,10 +241,23 @@ async function rm(argv: string[]) {
   if (positionals.length !== 1) throw new Error("usage: tack rm <slug> [--v n]");
   const cfg = await loadConfig(o.url);
   const slug = positionals[0];
-  const target = `/api/docs/${encodeURIComponent(slug)}${o.v ? `/v/${Number(o.v)}` : ""}`;
+  if (o.v !== undefined && !/^[1-9]\d*$/.test(o.v)) throw new Error("--v needs a version number, e.g. --v 2");
+  const target = `/api/docs/${encodeURIComponent(slug)}${o.v ? `/v/${o.v}` : ""}`;
   const res = await api<{ latest?: number }>(cfg, target, { method: "DELETE" });
+  if (!o.v) await remap(cfg, slug, null);
   if (o.json) return printJson(res);
   console.log(o.v ? `deleted ${slug} v${o.v} (latest is now v${res.latest})` : `deleted ${slug}`);
+}
+
+async function remap(cfg: Config, from: string, to: string | null) {
+  const dir = path.join(CONFIG_DIR, "paths");
+  for (const name of await readdir(dir).catch(() => [])) {
+    const file = path.join(dir, name);
+    const [mapped, url = ""] = ((await readText(file)) ?? "").split("\n");
+    if (mapped.trim() !== from || (url.trim() || cfg.url) !== cfg.url) continue;
+    if (to) await writeFile(file, `${to}\n${cfg.url}\n`, { mode: 0o600 });
+    else await removeFile(file, { force: true });
+  }
 }
 
 async function mv(argv: string[]) {
@@ -254,12 +270,7 @@ async function mv(argv: string[]) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ to }),
   });
-  const dir = path.join(CONFIG_DIR, "paths");
-  for (const name of await readdir(dir).catch(() => [])) {
-    const file = path.join(dir, name);
-    const [mapped, url = cfg.url] = ((await readText(file)) ?? "").split("\n");
-    if (mapped.trim() === from && (url.trim() || cfg.url) === cfg.url) await writeFile(file, `${res.slug}\n${cfg.url}\n`);
-  }
+  await remap(cfg, from, res.slug);
   if (o.json) return printJson(res);
   console.log(res.url);
 }
@@ -333,10 +344,12 @@ async function update(argv: string[]) {
 }
 
 async function gitRoot(file: string): Promise<string | null> {
-  for (let dir = path.dirname(file); ; dir = path.dirname(dir)) {
+  const home = homedir();
+  for (let dir = path.dirname(file); dir !== home; dir = path.dirname(dir)) {
     if (await stat(path.join(dir, ".git")).catch(() => null)) return dir;
     if (path.dirname(dir) === dir) return null;
   }
+  return null;
 }
 
 async function setup(argv: string[]) {
@@ -352,8 +365,11 @@ async function setup(argv: string[]) {
   if (o.token) {
     await connect({ url, token }, 1);
   } else {
-    console.log("setting TACK_TOKEN on the Worker with wrangler...");
     const repo = path.join(path.dirname(await realpath(process.argv[1])), "..");
+    if (!(await stat(path.join(repo, "wrangler.jsonc")).catch(() => null))) {
+      throw new Error("creating or rotating the token runs wrangler from a tack checkout; on this machine use `tack setup --token <token>`");
+    }
+    console.log("setting TACK_TOKEN on the Worker with wrangler...");
     if ((await run(["bunx", "wrangler", "secret", "put", "TACK_TOKEN"], { input: token, cwd: repo, inherit: true })) !== 0) {
       throw new Error(
         "wrangler failed. Is the Worker deployed and are you logged in (`bunx wrangler login`)? With several Cloudflare accounts, set CLOUDFLARE_ACCOUNT_ID.",
@@ -425,32 +441,54 @@ async function api<T>(cfg: Config, pathname: string, init?: RequestInit): Promis
   return body;
 }
 
+type Budget = { files: number; bytes: number };
+
 async function collect(abs: string): Promise<Record<string, Uint8Array>> {
   const st = await stat(abs).catch(() => null);
   if (!st) throw new Error(`no such file or folder: ${abs}`);
   const files: Record<string, Uint8Array> = Object.create(null);
+  const budget: Budget = { files: 0, bytes: 0 };
   if (st.isFile()) {
     if (!/\.html?$/i.test(abs)) throw new Error("upload an .html file, or a folder containing index.html");
-    await collectFile(abs, files);
+    await collectFile(abs, files, budget);
   } else {
-    for (const rel of await walk(abs)) files[rel] = await readFile(path.join(abs, ...rel.split("/")));
+    const root = await realpath(abs);
+    for (const rel of await walk(abs)) {
+      const real = await realpath(path.join(abs, ...rel.split("/"))).catch(() => null);
+      if (!real?.startsWith(root + path.sep)) continue;
+      const data = await readRegular(real, budget);
+      if (data) files[rel] = data;
+    }
     if (!Object.hasOwn(files, "index.html")) throw new Error(`${abs} has no index.html`);
   }
-  const count = Object.keys(files).length;
-  if (count > MAX_FILES) throw new Error(`${count} files; the limit is ${MAX_FILES} per upload`);
-  const total = Object.values(files).reduce((n, bytes) => n + bytes.byteLength, 0);
-  if (total > MAX_UPLOAD_BYTES) throw new Error(`upload is ${(total / 1048576).toFixed(1)} MB; the limit is 30 MB`);
   return files;
 }
 
-async function walk(dir: string, prefix = ""): Promise<string[]> {
-  const out: string[] = [];
+async function walk(dir: string, prefix = "", out: string[] = []): Promise<string[]> {
   for (const ent of await readdir(dir, { withFileTypes: true })) {
     if (ent.name.startsWith(".") || ent.name === "node_modules") continue;
-    if (ent.isDirectory()) out.push(...(await walk(path.join(dir, ent.name), `${prefix}${ent.name}/`)));
+    if (ent.name.includes("\\")) throw new Error(`file names with a backslash aren't supported: ${prefix}${ent.name}`);
+    if (ent.isDirectory()) await walk(path.join(dir, ent.name), `${prefix}${ent.name}/`, out);
     else if (ent.isFile()) out.push(`${prefix}${ent.name}`);
+    if (out.length > MAX_FILES) throw new Error(`more than ${MAX_FILES} files; that's the limit per upload`);
   }
   return out;
+}
+
+async function readRegular(file: string, budget: Budget): Promise<Buffer | null> {
+  const handle = await openFile(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)).catch(() => null);
+  if (!handle) return null;
+  try {
+    const st = await handle.stat();
+    if (!st.isFile()) return null;
+    budget.files += 1;
+    budget.bytes += st.size;
+    if (budget.files > MAX_FILES) throw new Error(`more than ${MAX_FILES} files; that's the limit per upload`);
+    if (budget.bytes > MAX_UPLOAD_BYTES) throw new Error("the upload is over the 30 MB limit");
+    return await handle.readFile();
+  } finally {
+    await handle.close();
+  }
 }
 
 async function readStdin(): Promise<Record<string, Uint8Array>> {
@@ -466,10 +504,11 @@ async function readStdin(): Promise<Record<string, Uint8Array>> {
   return { "index.html": Buffer.concat(chunks) };
 }
 
-async function collectFile(abs: string, files: Record<string, Uint8Array>) {
+async function collectFile(abs: string, files: Record<string, Uint8Array>, budget: Budget) {
   const root = await realpath(path.dirname(abs));
   const main = path.basename(abs);
-  const html = await readFile(abs);
+  const html = await readRegular(await realpath(abs), budget);
+  if (!html) throw new Error(`can't read ${abs}`);
   files["index.html"] = html;
   const seen = new Set(["index.html", main]);
   const queue: [string, Uint8Array][] = [[main, html]];
@@ -477,17 +516,29 @@ async function collectFile(abs: string, files: Record<string, Uint8Array>) {
     const [rel, bytes] = queue.shift()!;
     const ext = path.extname(rel).toLowerCase();
     if (![".html", ".htm", ".css"].includes(ext)) continue;
-    for (const ref of localRefs(new TextDecoder().decode(bytes), ext === ".css")) {
+    const text = new TextDecoder().decode(bytes);
+    let from = path.posix.dirname(rel);
+    if (ext !== ".css") {
+      const base = text.match(/<base\s[^>]*href\s*=\s*["']?([^"'\s>]+)/i)?.[1];
+      if (base && /^([a-z][a-z0-9+.-]*:|\/)/i.test(base)) continue;
+      if (base) from = path.posix.join(from, base.endsWith("/") ? base : path.posix.dirname(base));
+    }
+    for (const ref of localRefs(text, ext === ".css")) {
       if (ref.includes("\\")) continue;
-      const target = path.posix.normalize(path.posix.join(path.posix.dirname(rel), ref));
+      const target = path.posix.normalize(path.posix.join(from, ref.endsWith("/") ? `${ref}index.html` : ref));
       if (target === main && main !== "index.html") files[main] = html;
-      if (seen.has(target) || target.split("/").some((seg) => seg.startsWith("."))) continue;
-      seen.add(target);
-      const real = await realpath(path.join(root, ...target.split("/"))).catch(() => null);
-      if (!real?.startsWith(root + path.sep) || !(await stat(real)).isFile()) continue;
-      const data = await readFile(real);
-      files[target] = data;
-      queue.push([target, data]);
+      const candidates = path.posix.extname(target) ? [target] : [target, `${target}.html`, `${target}/index.html`];
+      for (const candidate of candidates) {
+        if (seen.has(candidate) || candidate.startsWith("../") || candidate.split("/").some((seg) => seg.startsWith("."))) continue;
+        seen.add(candidate);
+        const real = await realpath(path.join(root, ...candidate.split("/"))).catch(() => null);
+        if (!real?.startsWith(root + path.sep)) continue;
+        const data = await readRegular(real, budget);
+        if (!data) continue;
+        files[candidate] = data;
+        queue.push([candidate, data]);
+        break;
+      }
     }
   }
 }
