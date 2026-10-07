@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file
 import { chmod, mkdir, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -8,6 +8,7 @@ const DEFAULT_URL = "https://tack.rex.wf";
 const CONFIG_DIR = path.join(process.env.XDG_CONFIG_HOME || path.join(homedir(), ".config"), "tack");
 const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
 const MAX_UPLOAD_BYTES = 30 * 1024 * 1024;
+const MAX_FILES = 200;
 const common = { url: { type: "string" }, json: { type: "boolean" } } as const;
 
 const HELP = `tack - publish HTML docs to your tack instance
@@ -145,7 +146,9 @@ async function get(argv: string[]) {
   if (positionals.length !== 1) throw new Error("usage: tack get <slug|url> [--v n]");
   const cfg = await loadConfig(o.url);
   const ref = positionals[0];
-  const url = /^https?:\/\//i.test(ref)
+  const isUrl = /^https?:\/\//i.test(ref);
+  if (isUrl && o.v) throw new Error("--v only works with a slug; for a URL, use its /v/<n>/ form");
+  const url = isUrl
     ? new URL(ref)
     : new URL(`/${ref.replace(/^\/+|\/+$/g, "")}/${o.v ? `v/${o.v}/` : ""}`, cfg.url);
   url.hash = "";
@@ -272,18 +275,20 @@ function accessError(cfg: Config) {
 async function collect(abs: string): Promise<Record<string, Uint8Array>> {
   const st = await stat(abs).catch(() => null);
   if (!st) throw new Error(`no such file or folder: ${abs}`);
-  const files: Record<string, Uint8Array> = {};
+  const files: Record<string, Uint8Array> = Object.create(null);
   if (st.isFile()) {
     if (!/\.html?$/i.test(abs)) throw new Error("upload an .html file, or a folder containing index.html");
     files["index.html"] = await Bun.file(abs).bytes();
   } else {
-    for await (const rel of new Bun.Glob("**").scan({ cwd: abs, onlyFiles: true, followSymlinks: true })) {
+    for await (const rel of new Bun.Glob("**").scan({ cwd: abs, onlyFiles: true })) {
       const key = rel.split(path.sep).join("/");
       if (key.split("/").includes("node_modules")) continue;
       files[key] = await Bun.file(path.join(abs, rel)).bytes();
     }
-    if (!files["index.html"]) throw new Error(`${abs} has no index.html`);
+    if (!Object.hasOwn(files, "index.html")) throw new Error(`${abs} has no index.html`);
   }
+  const count = Object.keys(files).length;
+  if (count > MAX_FILES) throw new Error(`${count} files; the limit is ${MAX_FILES} per upload`);
   const total = Object.values(files).reduce((n, bytes) => n + bytes.byteLength, 0);
   if (total > MAX_UPLOAD_BYTES) throw new Error(`upload is ${(total / 1048576).toFixed(1)} MB; the limit is 30 MB`);
   return files;
@@ -295,7 +300,8 @@ function extractTitle(html: string): string {
   return decodeEntities(m[1].replace(/<[^>]*>/g, ""))
     .replace(/\s+/g, " ")
     .trim()
-    .slice(0, 300);
+    .slice(0, 300)
+    .toWellFormed();
 }
 
 function decodeEntities(s: string): string {
