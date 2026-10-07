@@ -1,13 +1,14 @@
 {
   "compilerOptions": {
-    "target": "esnext",
-    "lib": ["esnext"],
-    "module": "esnext",
-    "moduleResolution": "bundler",
-    "types": ["bun"],
+    "target": "es2023",
+    "lib": ["es2024"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "types": ["node"],
     "strict": true,
     "noEmit": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "erasableSyntaxOnly": true
   },
   "include": ["tack.ts"]
 }

@@ -13,20 +13,20 @@ An agent runs `tack upload plan.html` and replies with a link. Uploading again a
 
 1. Create an R2 bucket named `tack`.
 2. Workers & Pages → Import this repo. Deploy command `bunx wrangler deploy`, build variable `BUN_VERSION=1.4.0`. Set your domain in `wrangler.jsonc` and `DEFAULT_URL` in `cli/tack.ts`.
-3. Install the CLI and skill:
+3. Install the CLI and skill (running from the repo needs Node 22.18+):
 
 ```sh
 bun install
-ln -s "$PWD/cli/tack.ts" ~/.bun/bin/tack
+ln -s "$PWD/cli/tack.ts" ~/.local/bin/tack
 ln -s "$PWD/skill/tack" ~/.agents/skills/tack
 tack setup   # creates a token and sets it on the Worker
 tack open    # unlocks the doc list in your browser
 ```
 
-Any other machine with Bun installs from your instance:
+Any other machine with Node 20+ installs from your instance:
 
 ```sh
-curl -fsSL https://tack.rex.wf/cli -o ~/.bun/bin/tack && chmod +x ~/.bun/bin/tack
+curl -fsSL https://tack.rex.wf/cli -o ~/.local/bin/tack && chmod +x ~/.local/bin/tack
 curl -fsSL https://tack.rex.wf/skill.md --create-dirs -o ~/.agents/skills/tack/SKILL.md
 tack setup --token <token>   # token is in ~/.config/tack/config.json on the first machine
 ```

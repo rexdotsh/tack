@@ -10,10 +10,11 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "types": "wrangler types --include-env=false",
-    "check": "bun run types >/dev/null && tsc --noEmit && tsc --noEmit -p cli"
+    "check": "bun run types >/dev/null && tsc --noEmit && tsc --noEmit -p cli",
+    "build:cli": "bun build cli/tack.ts --target=node --outfile=dist/cli"
   },
   "devDependencies": {
-    "@types/bun": "^1.4.2",
+    "@types/node": "^26.6.4",
     "typescript": "^7.0.2",
     "wrangler": "^4.148.0"
   }

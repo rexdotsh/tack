@@ -1,7 +1,10 @@
-#!/usr/bin/env -S bun --no-env-file
-import { chmod, lstat, mkdir, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
+#!/usr/bin/env node
+import { spawn } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
+import { chmod, lstat, mkdir, readdir, readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { parseArgs } from "node:util";
 
 const DEFAULT_URL = "https://tack.rex.wf";
@@ -57,12 +60,12 @@ type Receipt = {
 type DocSummary = { slug: string; title: string; updatedAt: string; latest: number; versions: number; url: string };
 
 class HttpError extends Error {
-  constructor(
-    message: string,
-    readonly status: number,
-    readonly body: Record<string, unknown> = {},
-  ) {
+  status: number;
+  body: Record<string, unknown>;
+  constructor(message: string, status: number, body: Record<string, unknown> = {}) {
     super(message);
+    this.status = status;
+    this.body = body;
   }
 }
 
@@ -74,11 +77,7 @@ if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") {
 } else if (!commands[cmd]) {
   fail(`unknown command "${cmd}" (try: tack help)`);
 } else {
-  try {
-    await commands[cmd](rest);
-  } catch (err) {
-    fail(err instanceof Error ? err.message : String(err));
-  }
+  commands[cmd](rest).catch((err) => fail(err instanceof Error ? err.message : String(err)));
 }
 
 async function upload(argv: string[]) {
@@ -143,7 +142,7 @@ async function upload(argv: string[]) {
 
   if (!stdin) {
     await mkdir(path.dirname(mapFile), { recursive: true });
-    await Bun.write(mapFile, `${receipt.slug}\n${cfg.url}\n`);
+    await writeFile(mapFile, `${receipt.slug}\n${cfg.url}\n`);
   }
 
   const updateCommand = `tack upload ${stdin ? "-" : shellQuote(abs)} --slug ${receipt.slug}`;
@@ -182,7 +181,7 @@ async function sendBlobs(
           break;
         } catch (err) {
           if (attempt >= 4 || !(err instanceof HttpError) || err.status !== 503) throw err;
-          await Bun.sleep(1000 * attempt);
+          await sleep(1000 * attempt);
         }
       }
     }
@@ -213,7 +212,7 @@ async function get(argv: string[]) {
     const slug = res.headers.get("x-tack-slug");
     process.stderr.write(`# ${slug} v${version} of ${res.headers.get("x-tack-latest-version")}\n`);
   }
-  await Bun.write(Bun.stdout, await res.arrayBuffer());
+  process.stdout.write(Buffer.from(await res.arrayBuffer()));
 }
 
 async function list(argv: string[]) {
@@ -261,7 +260,7 @@ async function mv(argv: string[]) {
   for (const name of await readdir(dir).catch(() => [])) {
     const file = path.join(dir, name);
     const [mapped, url = cfg.url] = ((await readText(file)) ?? "").split("\n");
-    if (mapped.trim() === from && (url.trim() || cfg.url) === cfg.url) await Bun.write(file, `${res.slug}\n${cfg.url}\n`);
+    if (mapped.trim() === from && (url.trim() || cfg.url) === cfg.url) await writeFile(file, `${res.slug}\n${cfg.url}\n`);
   }
   if (o.json) return printJson(res);
   console.log(res.url);
@@ -279,7 +278,17 @@ async function open(argv: string[]) {
   console.log(target);
   const gui = process.platform === "darwin" || process.env.DISPLAY || process.env.WAYLAND_DISPLAY;
   const launcher = process.platform === "darwin" ? "open" : process.platform === "linux" && gui ? "xdg-open" : null;
-  if (launcher && Bun.which(launcher)) Bun.spawn([launcher, target], { stdout: "ignore", stderr: "ignore" }).unref();
+  if (launcher) spawn(launcher, [target], { stdio: "ignore", detached: true }).on("error", () => {}).unref();
+}
+
+function run(cmd: string[], opts: { input?: string; cwd?: string; inherit?: boolean } = {}): Promise<number> {
+  return new Promise((resolve) => {
+    const out = opts.inherit ? "inherit" : "ignore";
+    const child = spawn(cmd[0], cmd.slice(1), { cwd: opts.cwd, stdio: [opts.input === undefined ? "ignore" : "pipe", out, out] });
+    child.on("error", () => resolve(-1));
+    child.on("close", (code) => resolve(code ?? -1));
+    if (opts.input !== undefined) child.stdin?.end(opts.input);
+  });
 }
 
 async function copy(text: string): Promise<boolean> {
@@ -293,9 +302,7 @@ async function copy(text: string): Promise<boolean> {
             ...(process.env.DISPLAY ? [["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]] : []),
           ];
   for (const cmd of candidates) {
-    if (!Bun.which(cmd[0])) continue;
-    const proc = Bun.spawn(cmd, { stdin: new Blob([text]), stdout: "ignore", stderr: "ignore" });
-    if ((await proc.exited) === 0) return true;
+    if ((await run(cmd, { input: text })) === 0) return true;
   }
   return false;
 }
@@ -303,7 +310,7 @@ async function copy(text: string): Promise<boolean> {
 async function update(argv: string[]) {
   const { values: o } = parseArgs({ args: argv, options: common });
   const cfg = await loadConfig(o.url);
-  const self = await realpath(Bun.main);
+  const self = await realpath(process.argv[1]);
   if (await stat(path.join(path.dirname(self), "..", ".git")).catch(() => null)) {
     throw new Error(`${self} is in a git checkout; use git pull instead`);
   }
@@ -314,7 +321,7 @@ async function update(argv: string[]) {
     const res = await request(cfg, route);
     const body = await res.text();
     if (!res.ok || (route === "/cli" && !body.startsWith("#!/usr/bin/env"))) throw new Error(`couldn't download ${cfg.url}${route}`);
-    await Bun.write(`${file}.new`, body);
+    await writeFile(`${file}.new`, body);
     if (route === "/cli") await chmod(`${file}.new`, 0o755);
     await rename(`${file}.new`, file);
     console.log(`updated ${file}`);
@@ -329,19 +336,14 @@ async function setup(argv: string[]) {
   const current = ((await readJson(CONFIG_FILE)) ?? {}) as Partial<Config>;
   const url = instanceUrl(o.url || process.env.TACK_URL || current.url || DEFAULT_URL);
   const token =
-    o.token || (!o.rotate && current.token) || Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
+    o.token || (!o.rotate && current.token) || randomBytes(32).toString("base64url");
 
   if (o.token) {
     await connect({ url, token }, 1);
   } else {
     console.log("setting TACK_TOKEN on the Worker with wrangler...");
-    const proc = Bun.spawn(["bunx", "wrangler", "secret", "put", "TACK_TOKEN"], {
-      cwd: path.join(import.meta.dir, ".."),
-      stdin: new Blob([token]),
-      stdout: "inherit",
-      stderr: "inherit",
-    });
-    if ((await proc.exited) !== 0) {
+    const repo = path.join(path.dirname(await realpath(process.argv[1])), "..");
+    if ((await run(["bunx", "wrangler", "secret", "put", "TACK_TOKEN"], { input: token, cwd: repo, inherit: true })) !== 0) {
       throw new Error(
         "wrangler failed. Is the Worker deployed and are you logged in (`bunx wrangler login`)? With several Cloudflare accounts, set CLOUDFLARE_ACCOUNT_ID.",
       );
@@ -363,7 +365,7 @@ async function connect(cfg: Config, tries: number) {
       return;
     } catch (err) {
       if (attempt >= tries || !(err instanceof HttpError) || ![401, 503].includes(err.status)) throw err;
-      await Bun.sleep(2000);
+      await sleep(2000);
     }
   }
 }
@@ -419,11 +421,7 @@ async function collect(abs: string): Promise<Record<string, Uint8Array>> {
     if (!/\.html?$/i.test(abs)) throw new Error("upload an .html file, or a folder containing index.html");
     await collectFile(abs, files);
   } else {
-    for await (const rel of new Bun.Glob("**").scan({ cwd: abs, onlyFiles: true })) {
-      const key = rel.split(path.sep).join("/");
-      if (key.split("/").includes("node_modules")) continue;
-      files[key] = await Bun.file(path.join(abs, rel)).bytes();
-    }
+    for (const rel of await walk(abs)) files[rel] = await readFile(path.join(abs, ...rel.split("/")));
     if (!Object.hasOwn(files, "index.html")) throw new Error(`${abs} has no index.html`);
   }
   const count = Object.keys(files).length;
@@ -433,18 +431,33 @@ async function collect(abs: string): Promise<Record<string, Uint8Array>> {
   return files;
 }
 
+async function walk(dir: string, prefix = ""): Promise<string[]> {
+  const out: string[] = [];
+  for (const ent of await readdir(dir, { withFileTypes: true })) {
+    if (ent.name.startsWith(".") || ent.name === "node_modules") continue;
+    if (ent.isDirectory()) out.push(...(await walk(path.join(dir, ent.name), `${prefix}${ent.name}/`)));
+    else if (ent.isFile()) out.push(`${prefix}${ent.name}`);
+  }
+  return out;
+}
+
 async function readStdin(): Promise<Record<string, Uint8Array>> {
   if (process.stdin.isTTY) throw new Error("pipe the HTML in, e.g. `cat page.html | tack upload -`");
-  const html = new Uint8Array(await Bun.stdin.arrayBuffer());
-  if (!html.byteLength) throw new Error("nothing on stdin");
-  if (html.byteLength > MAX_UPLOAD_BYTES) throw new Error("stdin is over the 30 MB limit");
-  return { "index.html": html };
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of process.stdin) {
+    size += chunk.length;
+    if (size > MAX_UPLOAD_BYTES) throw new Error("stdin is over the 30 MB limit");
+    chunks.push(chunk);
+  }
+  if (!size) throw new Error("nothing on stdin");
+  return { "index.html": Buffer.concat(chunks) };
 }
 
 async function collectFile(abs: string, files: Record<string, Uint8Array>) {
   const root = await realpath(path.dirname(abs));
   const main = path.basename(abs);
-  const html = await Bun.file(abs).bytes();
+  const html = await readFile(abs);
   files["index.html"] = html;
   const seen = new Set(["index.html", main]);
   const queue: [string, Uint8Array][] = [[main, html]];
@@ -460,7 +473,7 @@ async function collectFile(abs: string, files: Record<string, Uint8Array>) {
       seen.add(target);
       const real = await realpath(path.join(root, ...target.split("/"))).catch(() => null);
       if (!real?.startsWith(root + path.sep) || !(await stat(real)).isFile()) continue;
-      const data = await Bun.file(real).bytes();
+      const data = await readFile(real);
       files[target] = data;
       queue.push([target, data]);
     }
@@ -524,17 +537,21 @@ function makeSlug(base: string): string {
     .map((w) => w.slice(0, 16))
     .join("-") || "doc";
   const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
-  const suffix = Array.from(crypto.getRandomValues(new Uint8Array(10)), (b) => alphabet[b % alphabet.length]).join("");
+  const suffix = Array.from(randomBytes(10), (b) => alphabet[b % alphabet.length]).join("");
   return `${stem}-${suffix}`;
 }
 
 function sha256(data: string | Uint8Array): string {
-  return new Bun.CryptoHasher("sha256").update(data).digest("hex");
+  return createHash("sha256").update(data).digest("hex");
 }
 
 async function readText(file: string): Promise<string | null> {
-  const f = Bun.file(file);
-  return (await f.exists()) ? f.text() : null;
+  try {
+    return await readFile(file, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
 }
 
 async function readJson(file: string): Promise<unknown> {
@@ -555,8 +572,8 @@ function printJson(value: unknown) {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
 
-function fail(message: string): never {
+function fail(message: string) {
   if (process.argv.includes("--json")) printJson({ ok: false, error: message });
   else process.stderr.write(`tack: ${message}\n`);
-  process.exit(1);
+  process.exitCode = 1;
 }
