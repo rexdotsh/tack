@@ -9,7 +9,7 @@ description: Use when the user wants an HTML write-up (plan, spec, report, findi
 
 ## Publish a new doc
 
-0. If the doc might already exist (same subject as earlier work), check first with `tack list --match "<words from the title>" --json`. If one matches, update it instead (see below) rather than creating a duplicate.
+0. If the doc might already exist (same subject as earlier work), check first with `tack list --match "<words from the title>" --json`. Update an existing doc only when it's clearly the same document (same subject, or the one the user means). If several match or you're unsure, ask the user which one, or create a new doc.
 1. Write a self-contained HTML file. Inline CSS/JS is fine, as are external https assets. Give it a good `<title>`; it becomes the doc title and the start of the slug.
    Local images, CSS and pages that the file references with relative paths (`img/chart.png`, `details.html`) are uploaded with it automatically, as long as they're in its folder or below. You can also upload a whole folder with an `index.html`.
 2. Run `tack upload <file-or-folder> --new --json`. Don't pass your own `--slug` for a new doc; the generated one has a random part that keeps the link private.
@@ -36,4 +36,4 @@ To see what changed between versions, fetch `https://tack.rex.wf/<slug>/_diff?a=
 
 `tack list [--match <words>] [--json]`, `tack rm <slug> [--v <n>]`, `tack mv <slug> <new-slug>`, `tack help`. Don't run `tack open`; it's for the user.
 
-Never put the tack token, the config file, or the `tack open` link in a doc or a chat reply. If tack reports a bad or missing token, ask the user to run `tack setup`. If `tack` isn't installed, ask the user to install it (`curl -fsSL https://tack.rex.wf/cli`, see the tack README) rather than writing your own uploader.
+Never put the tack token, the config file, or the `tack open` link in a doc or a chat reply. If tack reports a bad or missing token, ask the user to run `tack setup`. If `tack` isn't installed, ask the user to install it (`curl -fsSL https://tack.rex.wf/install | sh`) rather than writing your own uploader.

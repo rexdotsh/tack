@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { chmod, lstat, mkdir, readdir, readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readdir, readFile, realpath, rename, rm as removeFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -12,6 +12,7 @@ const CONFIG_DIR = path.join(process.env.XDG_CONFIG_HOME || path.join(homedir(),
 const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
 const MAX_UPLOAD_BYTES = 30 * 1024 * 1024;
 const MAX_FILES = 200;
+const LOCAL_HOSTS = ["localhost", "127.0.0.1", "[::1]"];
 const common = { url: { type: "string" }, json: { type: "boolean" } } as const;
 const FILLER = new Set(
   "a an the of for and or to in on at by with from into about vs via is are be it its this that our your my how what why".split(" "),
@@ -287,6 +288,7 @@ function run(cmd: string[], opts: { input?: string; cwd?: string; inherit?: bool
     const child = spawn(cmd[0], cmd.slice(1), { cwd: opts.cwd, stdio: [opts.input === undefined ? "ignore" : "pipe", out, out] });
     child.on("error", () => resolve(-1));
     child.on("close", (code) => resolve(code ?? -1));
+    child.stdin?.on("error", () => {});
     if (opts.input !== undefined) child.stdin?.end(opts.input);
   });
 }
@@ -311,20 +313,32 @@ async function update(argv: string[]) {
   const { values: o } = parseArgs({ args: argv, options: common });
   const cfg = await loadConfig(o.url);
   const self = await realpath(process.argv[1]);
-  if (await stat(path.join(path.dirname(self), "..", ".git")).catch(() => null)) {
-    throw new Error(`${self} is in a git checkout; use git pull instead`);
-  }
-  const skill = path.join(homedir(), ".agents", "skills", "tack", "SKILL.md");
+  const repo = await gitRoot(self);
+  if (repo) throw new Error(`${self} is in a git checkout (${repo}); use git pull instead`);
   const targets: [string, string][] = [["/cli", self]];
-  if ((await lstat(skill).catch(() => null))?.isFile()) targets.push(["/skill.md", skill]);
+  const skill = path.join(homedir(), ".agents", "skills", "tack", "SKILL.md");
+  if ((await lstat(skill).catch(() => null))?.isFile()) {
+    const real = await realpath(skill);
+    if (!(await gitRoot(real))) targets.push(["/skill.md", real]);
+  }
   for (const [route, file] of targets) {
     const res = await request(cfg, route);
     const body = await res.text();
     if (!res.ok || (route === "/cli" && !body.startsWith("#!/usr/bin/env"))) throw new Error(`couldn't download ${cfg.url}${route}`);
-    await writeFile(`${file}.new`, body);
-    if (route === "/cli") await chmod(`${file}.new`, 0o755);
-    await rename(`${file}.new`, file);
+    const temp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.new`;
+    await writeFile(temp, body, { flag: "wx", mode: route === "/cli" ? 0o755 : 0o644 });
+    await rename(temp, file).catch(async (err) => {
+      await removeFile(temp, { force: true });
+      throw err;
+    });
     console.log(`updated ${file}`);
+  }
+}
+
+async function gitRoot(file: string): Promise<string | null> {
+  for (let dir = path.dirname(file); ; dir = path.dirname(dir)) {
+    if (await stat(path.join(dir, ".git")).catch(() => null)) return dir;
+    if (path.dirname(dir) === dir) return null;
   }
 }
 
@@ -380,7 +394,7 @@ async function loadConfig(flagUrl?: string): Promise<Config> {
 
 function instanceUrl(raw: string): string {
   const url = new URL(raw);
-  if (url.protocol !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) {
+  if (url.protocol !== "https:" && !LOCAL_HOSTS.includes(url.hostname)) {
     throw new Error(`${raw}: use https (plain http is only allowed for localhost)`);
   }
   return raw.replace(/\/+$/, "");
@@ -401,6 +415,7 @@ async function request(cfg: Config, target: string, init: RequestInit = {}): Pro
     const location = res.headers.get("location");
     if (res.status < 300 || res.status >= 400 || !location) return res;
     url = new URL(location, url);
+    if (url.protocol !== "https:" && !LOCAL_HOSTS.includes(url.hostname)) throw new Error(`refusing to follow a redirect to ${url.origin}`);
   }
   throw new Error("too many redirects");
 }

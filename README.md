@@ -23,11 +23,10 @@ tack setup   # creates a token and sets it on the Worker
 tack open    # unlocks the doc list in your browser
 ```
 
-Any other machine with Node 20+ installs from your instance:
+Any other machine with Node 20+ installs the CLI and skill from your instance:
 
 ```sh
-curl -fsSL https://tack.rex.wf/cli -o ~/.local/bin/tack && chmod +x ~/.local/bin/tack
-curl -fsSL https://tack.rex.wf/skill.md --create-dirs -o ~/.agents/skills/tack/SKILL.md
+curl -fsSL https://tack.rex.wf/install | sh
 tack setup --token <token>   # token is in ~/.config/tack/config.json on the first machine
 ```
 

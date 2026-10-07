@@ -23,7 +23,7 @@ type LiveState = { rev: number; latest?: number; count?: number; moved?: string;
 
 const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const MAX_FILES = 200;
-const RESERVED_SLUGS = new Set(["api", "login", "cli"]);
+const RESERVED_SLUGS = new Set(["api", "login", "cli", "install"]);
 const RESERVED_PATHS = new Set(["v", "_history", "_diff", "_live"]);
 const HASH_RE = /^[0-9a-f]{64}$/;
 const LOCK_MS = 5 * 60_000;
@@ -450,6 +450,7 @@ async function serveDoc(req: Request, env: Env, ctx: ExecutionContext, url: URL)
     at: version.at,
     note: version.note ?? "",
     rev: meta.rev ?? 0,
+    seenKey: hash36(`seen:${slug}`),
   };
   const etag = `"${hash.slice(0, 32)}${inject ? `-${hash36(BAR_JS + JSON.stringify(bar))}` : ""}"`;
   const headers = new Headers({
@@ -492,6 +493,7 @@ const BAR_JS = `(function (d) {
     if (s < 604800) return Math.floor(s / 86400) + "d ago";
     return new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric" });
   };
+  var ageText = function () { return "\u2009·\u2009" + (news ? "updated " : "") + ago(d.at); };
   var arrow = function (n, label, path) {
     if (!n) return "";
     return '<a class="ar" href="' + e(href(n)) + '" aria-label="' + label + '" title="' + label + '">' +
@@ -501,9 +503,9 @@ const BAR_JS = `(function (d) {
   var dead = false, fresh = false, news = false, tries = 0, ws = null, host, root;
   if (!d.pinned) {
     try {
-      var seen = Number(localStorage.getItem("tack:seen:" + d.slug)) || 0;
+      var seen = Number(localStorage.getItem("tack:seen:" + d.seenKey)) || 0;
       news = seen > 0 && seen < d.latest;
-      localStorage.setItem("tack:seen:" + d.slug, String(d.latest));
+      localStorage.setItem("tack:seen:" + d.seenKey, String(d.latest));
     } catch (_) {}
   }
   var render = function () {
@@ -536,14 +538,17 @@ const BAR_JS = `(function (d) {
       arrow(d.prev, "Previous version", "m15 18-6-6 6-6") +
       '<a class="v" href="' + e(base + "_history") + '" title="' + e("v" + d.n + " · " + when + (d.note ? " · " + d.note : "")) + '">' +
       "<b>v" + d.n + "</b><span>&thinsp;/&thinsp;" + d.latest + "</span>" +
-      '<span class="age' + (news ? " up" : "") + '">&thinsp;·&thinsp;' + (news ? "updated " : "") + ago(d.at) + "</span></a>" +
+      '<span class="age' + (news ? " up" : "") + '">' + e(ageText()) + "</span></a>" +
       arrow(d.next, "Next version", "m9 18 6-6-6-6") +
       (d.prev ? '<a class="ch" href="' + e(base + "_diff?a=" + d.prev + "&b=" + d.n) + '" title="What changed in v' + d.n + '">changes</a>' : "") +
       (fresh && d.latest > d.n ? '<a class="nw" href="' + e(base + d.sub) + '" title="Open v' + d.latest + '">new</a>' : "") +
       "</nav>";
   };
   render();
-  setInterval(function () { if (host) render(); }, 60000);
+  setInterval(function () {
+    var age = root && root.querySelector(".age");
+    if (age) age.textContent = ageText();
+  }, 60000);
   var sync = function (s) {
     if (!s || !(s.rev > d.rev)) return;
     d.rev = s.rev;
@@ -579,6 +584,7 @@ type BarData = {
   at: string;
   note: string;
   rev: number;
+  seenKey: string;
 };
 
 function withVersionBar(res: Response, data: BarData): Response {
