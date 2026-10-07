@@ -23,7 +23,7 @@ There are no automated tests. Verify changes against `bun run dev` with the CLI 
 
 ## Slugs
 
-New docs get up to three meaningful words from the title (filler words dropped) plus 10 random base36 characters. The random part is what keeps links private; don't shorten it.
+New docs get a slug of 10 random base36 characters (~51 bits), which is what keeps links private; don't shorten it. Links are printed without a trailing slash: single-page docs (and single-page pinned versions) are served at `/id` directly, multi-file ones redirect to `/id/` so relative links resolve.
 
 ## Rules
 

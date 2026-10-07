@@ -146,12 +146,12 @@ async function api(req: Request, env: Env, url: URL): Promise<Response> {
   if (!slug) {
     if (req.method !== "GET") return fail(405, "method not allowed");
     const docs = await listDocs(env);
-    return json({ ok: true, docs: docs.map((d) => ({ ...d, url: `${url.origin}/${d.slug}/` })) });
+    return json({ ok: true, docs: docs.map((d) => ({ ...d, url: `${url.origin}/${d.slug}` })) });
   }
   if (req.method === "GET") {
     const meta = await getMeta(env, slug);
     if (!meta) return fail(404, `no doc called "${slug}"`);
-    return json({ ok: true, url: `${url.origin}/${slug}/`, ...meta });
+    return json({ ok: true, url: `${url.origin}/${slug}`, ...meta });
   }
   if (req.method === "POST") return upload(req, env, url.origin, slug);
   if (req.method === "DELETE") return remove(env, slug);
@@ -234,7 +234,7 @@ async function upload(req: Request, env: Env, origin: string, slug: string): Pro
 }
 
 function receipt(origin: string, meta: Meta, v: Version, unchanged: boolean) {
-  const base = `${origin}/${meta.slug}/`;
+  const base = `${origin}/${meta.slug}`;
   return {
     ok: true,
     slug: meta.slug,
@@ -243,8 +243,8 @@ function receipt(origin: string, meta: Meta, v: Version, unchanged: boolean) {
     versions: meta.versions.length,
     unchanged,
     url: base,
-    versionUrl: `${base}v/${v.n}/`,
-    historyUrl: `${base}_history`,
+    versionUrl: `${base}/v/${v.n}`,
+    historyUrl: `${base}/_history`,
   };
 }
 
@@ -356,7 +356,7 @@ async function rename(req: Request, env: Env, origin: string, slug: string): Pro
   await notify(env, slug, { rev: moved.rev!, moved: to }, "end");
   await env.BUCKET.delete(metaKey(slug));
   await deleteBlobs(env, slug);
-  return json({ ok: true, from: slug, slug: to, url: `${origin}/${to}/` });
+  return json({ ok: true, from: slug, slug: to, url: `${origin}/${to}` });
 }
 
 async function getMeta(env: Env, slug: string): Promise<Meta | null> {
@@ -393,7 +393,6 @@ async function listDocs(env: Env): Promise<DocSummary[]> {
 async function serveDoc(req: Request, env: Env, ctx: ExecutionContext, url: URL): Promise<Response> {
   const [, slug, rest] = url.pathname.match(/^\/([^/]+)(\/.*)?$/) ?? [];
   if (!slug || !SLUG_RE.test(slug)) return notFound();
-  if (rest === undefined) return redirect(`/${slug}/${url.search}`);
   if (rest === "/_live") {
     if (req.headers.get("upgrade") !== "websocket") return fail(426, "expected a websocket");
     if (!(await env.BUCKET.head(metaKey(slug)))) return fail(404, "not found");
@@ -402,7 +401,8 @@ async function serveDoc(req: Request, env: Env, ctx: ExecutionContext, url: URL)
   const meta = await getMeta(env, slug);
   if (!meta) return notFound(`No doc called “${slug}”.`);
 
-  let sub = rest.slice(1);
+  const single = (v: Version) => Object.keys(v.files).length === 1;
+  let sub = rest?.slice(1) ?? "";
   if (sub === "_history") return html(historyPage(meta));
   if (sub === "_diff") return diffPage(env, ctx, meta, url);
 
@@ -413,10 +413,12 @@ async function serveDoc(req: Request, env: Env, ctx: ExecutionContext, url: URL)
   if (vm) {
     const found = meta.versions.find((v) => v.n === Number(vm[1]));
     if (!found) return notFound(`${slug} has no version ${vm[1]}.`, slug);
-    if (vm[2] === undefined) return redirect(`/${slug}/v/${found.n}/${url.search}`);
+    if (vm[2] === undefined && !single(found)) return redirect(`/${slug}/v/${found.n}/${url.search}`);
     version = found;
     pinned = true;
-    sub = vm[2].slice(1);
+    sub = vm[2]?.slice(1) ?? "";
+  } else if (rest === undefined && !single(version)) {
+    return redirect(`/${slug}/${url.search}`);
   }
 
   let path: string;

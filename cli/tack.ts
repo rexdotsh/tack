@@ -14,9 +14,6 @@ const MAX_UPLOAD_BYTES = 30 * 1024 * 1024;
 const MAX_FILES = 200;
 const LOCAL_HOSTS = ["localhost", "127.0.0.1", "[::1]"];
 const common = { url: { type: "string" }, json: { type: "boolean" } } as const;
-const FILLER = new Set(
-  "a an the of for and or to in on at by with from into about vs via is are be it its this that our your my how what why".split(" "),
-);
 
 const HELP = `tack - publish HTML docs to your tack instance
 
@@ -127,7 +124,7 @@ async function upload(argv: string[]) {
 
   let receipt: Receipt;
   for (let attempt = 0; ; attempt++) {
-    if (auto) slug = makeSlug(title || (stdin ? "doc" : path.basename(abs).replace(/\.html?$/i, "")));
+    if (auto) slug = makeSlug();
     try {
       receipt = await commit().catch(async (err) => {
         if (!(err instanceof HttpError) || err.status !== 428) throw err;
@@ -539,21 +536,9 @@ function decodeEntities(s: string): string {
   });
 }
 
-function makeSlug(base: string): string {
-  const words = base
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter(Boolean);
-  const meaningful = words.filter((w) => !FILLER.has(w));
-  const stem = (meaningful.length ? meaningful : words)
-    .slice(0, 3)
-    .map((w) => w.slice(0, 16))
-    .join("-") || "doc";
+function makeSlug(): string {
   const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
-  const suffix = Array.from(randomBytes(10), (b) => alphabet[b % alphabet.length]).join("");
-  return `${stem}-${suffix}`;
+  return Array.from(randomBytes(10), (b) => alphabet[b % alphabet.length]).join("");
 }
 
 function sha256(data: string | Uint8Array): string {
