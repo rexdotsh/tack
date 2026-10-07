@@ -1,5 +1,5 @@
 #!/usr/bin/env -S bun --no-env-file
-import { chmod, lstat, mkdir, readdir, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, realpath, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { parseArgs } from "node:util";
@@ -56,6 +56,7 @@ class HttpError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    readonly body: Record<string, unknown> = {},
   ) {
     super(message);
   }
@@ -100,25 +101,33 @@ async function upload(argv: string[]) {
   let slug = o.slug?.toLowerCase();
   let remembered = false;
   if (!slug && !o.new) {
-    slug = (await readText(mapFile))?.trim() || undefined;
+    slug = (await readText(mapFile))?.split("\n")[0].trim() || undefined;
     remembered = Boolean(slug);
   }
   const auto = !slug;
+  const hashes = Object.fromEntries(Object.entries(files).map(([p, bytes]) => [p, sha256(bytes)]));
   const body = JSON.stringify({
-    files: Object.fromEntries(Object.entries(files).map(([p, bytes]) => [p, Buffer.from(bytes).toString("base64")])),
+    files: hashes,
+    size: Object.values(files).reduce((n, bytes) => n + bytes.byteLength, 0),
     title: title || undefined,
     note: o.note || undefined,
     create: Boolean(o.new) || auto,
   });
+  const commit = () =>
+    api<Receipt>(cfg, `/api/docs/${encodeURIComponent(slug!)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+    });
 
   let receipt: Receipt;
   for (let attempt = 0; ; attempt++) {
     if (auto) slug = makeSlug(title || path.basename(abs).replace(/\.html?$/i, ""));
     try {
-      receipt = await api<Receipt>(cfg, `/api/docs/${encodeURIComponent(slug!)}`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body,
+      receipt = await commit().catch(async (err) => {
+        if (!(err instanceof HttpError) || err.status !== 428) throw err;
+        await sendBlobs(cfg, slug!, files, hashes, err.body.missing as string[]);
+        return commit();
       });
       break;
     } catch (err) {
@@ -128,7 +137,7 @@ async function upload(argv: string[]) {
   }
 
   await mkdir(path.dirname(mapFile), { recursive: true });
-  await Bun.write(mapFile, `${receipt.slug}\n`);
+  await Bun.write(mapFile, `${receipt.slug}\n${cfg.url}\n`);
 
   const updateCommand = `tack upload ${shellQuote(abs)} --slug ${receipt.slug}`;
   const extras = Object.keys(files).filter((p) => p !== "index.html");
@@ -145,6 +154,25 @@ async function upload(argv: string[]) {
     console.log("  (updated the doc this path was last uploaded to; pass --new for a separate doc)");
   }
   console.log(`  update with: ${updateCommand}`);
+}
+
+async function sendBlobs(
+  cfg: Config,
+  slug: string,
+  files: Record<string, Uint8Array>,
+  hashes: Record<string, string>,
+  missing: string[],
+) {
+  const byHash = new Map(Object.entries(hashes).map(([p, h]) => [h, files[p]]));
+  const queue = [...new Set(missing)];
+  const worker = async () => {
+    for (let hash; (hash = queue.shift()); ) {
+      const bytes = byHash.get(hash);
+      if (!bytes) throw new Error(`server asked for an unknown file ${hash}`);
+      await api(cfg, `/api/docs/${encodeURIComponent(slug)}/blobs/${hash}`, { method: "PUT", body: bytes });
+    }
+  };
+  await Promise.all(Array.from({ length: 4 }, worker));
 }
 
 async function get(argv: string[]) {
@@ -214,7 +242,8 @@ async function mv(argv: string[]) {
   const dir = path.join(CONFIG_DIR, "paths");
   for (const name of await readdir(dir).catch(() => [])) {
     const file = path.join(dir, name);
-    if ((await readText(file))?.trim() === from) await Bun.write(file, `${res.slug}\n`);
+    const [mapped, url = cfg.url] = ((await readText(file)) ?? "").split("\n");
+    if (mapped.trim() === from && (url.trim() || cfg.url) === cfg.url) await Bun.write(file, `${res.slug}\n${cfg.url}\n`);
   }
   if (o.json) return printJson(res);
   console.log(res.url);
@@ -225,19 +254,14 @@ async function open(argv: string[]) {
   const cfg = await loadConfig(o.url);
   const ref = positionals[0];
   let target: string;
-  if (ref) target = /^https?:\/\//i.test(ref) ? ref : `${cfg.url}/${ref.replace(/^\/+|\/+$/g, "")}/`;
+  if (ref) target = new URL(/^https?:\/\//i.test(ref) ? ref : `${cfg.url}/${ref.replace(/^\/+|\/+$/g, "")}/`).href;
   else if (cfg.token) target = `${cfg.url}/login?key=${sha256(`${cfg.token}:view`)}`;
   else throw new Error("no token yet (run `tack setup`)");
+  if (!/^https?:$/.test(new URL(target).protocol)) throw new Error("can only open http(s) links");
   console.log(target);
-  const launcher =
-    process.platform === "darwin"
-      ? ["open"]
-      : process.platform === "win32"
-        ? ["cmd", "/c", "start", ""]
-        : process.env.DISPLAY || process.env.WAYLAND_DISPLAY
-          ? ["xdg-open"]
-          : null;
-  if (launcher && Bun.which(launcher[0])) Bun.spawn([...launcher, target], { stdout: "ignore", stderr: "ignore" }).unref();
+  const gui = process.platform === "darwin" || process.env.DISPLAY || process.env.WAYLAND_DISPLAY;
+  const launcher = process.platform === "darwin" ? "open" : process.platform === "linux" && gui ? "xdg-open" : null;
+  if (launcher && Bun.which(launcher)) Bun.spawn([launcher, target], { stdout: "ignore", stderr: "ignore" }).unref();
 }
 
 async function copy(text: string): Promise<boolean> {
@@ -344,7 +368,7 @@ async function api<T>(cfg: Config, pathname: string, init?: RequestInit): Promis
   const res = await request(cfg, pathname, init);
   const body = (await res.json().catch(() => null)) as ({ ok?: boolean; error?: string } & T) | null;
   if (!body) throw new HttpError(`unexpected HTTP ${res.status} from ${cfg.url}${pathname}`, res.status);
-  if (!res.ok || !body.ok) throw new HttpError(body.error || `HTTP ${res.status}`, res.status);
+  if (!res.ok || !body.ok) throw new HttpError(body.error || `HTTP ${res.status}`, res.status, body);
   return body;
 }
 
@@ -371,7 +395,7 @@ async function collect(abs: string): Promise<Record<string, Uint8Array>> {
 }
 
 async function collectFile(abs: string, files: Record<string, Uint8Array>) {
-  const root = path.dirname(abs);
+  const root = await realpath(path.dirname(abs));
   const main = path.basename(abs);
   const html = await Bun.file(abs).bytes();
   files["index.html"] = html;
@@ -382,13 +406,14 @@ async function collectFile(abs: string, files: Record<string, Uint8Array>) {
     const ext = path.extname(rel).toLowerCase();
     if (![".html", ".htm", ".css"].includes(ext)) continue;
     for (const ref of localRefs(new TextDecoder().decode(bytes), ext === ".css")) {
+      if (ref.includes("\\")) continue;
       const target = path.posix.normalize(path.posix.join(path.posix.dirname(rel), ref));
       if (target === main && main !== "index.html") files[main] = html;
-      if (seen.has(target) || target.startsWith("../") || target.split("/").some((seg) => seg.startsWith("."))) continue;
+      if (seen.has(target) || target.split("/").some((seg) => seg.startsWith("."))) continue;
       seen.add(target);
-      const full = path.join(root, ...target.split("/"));
-      if (!(await lstat(full).catch(() => null))?.isFile()) continue;
-      const data = await Bun.file(full).bytes();
+      const real = await realpath(path.join(root, ...target.split("/"))).catch(() => null);
+      if (!real?.startsWith(root + path.sep) || !(await stat(real)).isFile()) continue;
+      const data = await Bun.file(real).bytes();
       files[target] = data;
       queue.push([target, data]);
     }
@@ -398,7 +423,7 @@ async function collectFile(abs: string, files: Record<string, Uint8Array>) {
 function localRefs(text: string, css: boolean): string[] {
   const refs: string[] = [];
   const add = (raw = "") => {
-    const ref = raw.trim().replace(/[?#].*$/, "");
+    const ref = decodeEntities(raw).trim().replace(/[?#].*$/, "");
     if (!ref || /^([a-z][a-z0-9+.-]*:|\/)/i.test(ref)) return;
     try {
       refs.push(decodeURIComponent(ref));
@@ -406,12 +431,13 @@ function localRefs(text: string, css: boolean): string[] {
       refs.push(ref);
     }
   };
+  const value = (m: RegExpMatchArray) => m[2] ?? m[3] ?? m[4];
   for (const m of text.matchAll(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi)) add(m[2]);
   for (const m of text.matchAll(/@import\s+(['"])([^'"]+)\1/gi)) add(m[2]);
   if (!css) {
-    for (const m of text.matchAll(/\s(?:src|href|poster)\s*=\s*(["'])(.*?)\1/gi)) add(m[2]);
-    for (const m of text.matchAll(/\ssrcset\s*=\s*(["'])(.*?)\1/gi)) {
-      for (const part of m[2].split(",")) add(part.trim().split(/\s+/)[0]);
+    for (const m of text.matchAll(/\s(src|href|poster)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/gi)) add(value(m));
+    for (const m of text.matchAll(/\s(srcset)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/gi)) {
+      for (const part of (value(m) ?? "").split(",")) add(part.trim().split(/\s+/)[0]);
     }
   }
   return refs;
@@ -453,8 +479,8 @@ function makeSlug(base: string): string {
   return `${stem}-${suffix}`;
 }
 
-function sha256(s: string): string {
-  return new Bun.CryptoHasher("sha256").update(s).digest("hex");
+function sha256(data: string | Uint8Array): string {
+  return new Bun.CryptoHasher("sha256").update(data).digest("hex");
 }
 
 async function readText(file: string): Promise<string | null> {
