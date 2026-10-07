@@ -1,0 +1,20 @@
+{
+  "name": "tack",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "tack": "cli/tack.ts"
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types --include-env=false",
+    "check": "bun run types >/dev/null && tsc --noEmit && tsc --noEmit -p cli"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.148.0"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tack",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-10-01",
+
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{ "pattern": "tack.rex.wf", "custom_domain": true }],
+
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "tack" }]
+}
