@@ -1,7 +1,5 @@
 <img src=".github/banner.png" alt="tack: let your agents pin HTML to your own Cloudflare" width="100%">
 
-Private HTML docs for agents, on your own Cloudflare.
-
 An agent runs `tack upload plan.html` and replies with a link. Uploading again adds a version under the same link, and open tabs update live.
 
 - **Secret links.** Anyone with a link can read it; nobody can guess one.
