@@ -6,9 +6,20 @@ lib="${XDG_DATA_HOME:-$HOME/.local/share}/tack"
 bin="$HOME/.local/bin"
 skill="$HOME/.agents/skills/tack"
 
-in_checkout() {
+physical() {
   dir="$1"
-  while [ "$dir" != "$HOME" ] && [ "$dir" != "/" ] && [ -n "$dir" ]; do
+  rest=""
+  while [ ! -d "$dir" ]; do
+    rest="/$(basename "$dir")$rest"
+    dir=$(dirname "$dir")
+  done
+  echo "$(cd "$dir" && pwd -P)$rest"
+}
+
+in_checkout() {
+  home=$(physical "$HOME")
+  dir=$(physical "$1")
+  while [ "$dir" != "$home" ] && [ "$dir" != "/" ] && [ -n "$dir" ]; do
     [ -e "$dir/.git" ] && return 0
     dir=$(dirname "$dir")
   done

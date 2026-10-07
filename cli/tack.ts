@@ -68,6 +68,11 @@ class HttpError extends Error {
   }
 }
 
+process.stdout.on("error", (err: NodeJS.ErrnoException) => {
+  if (err.code === "EPIPE") process.exit(0);
+  throw err;
+});
+
 const commands: Record<string, (argv: string[]) => Promise<void>> = { upload, get, list, open, rm, mv, update, setup };
 const [cmd, ...rest] = process.argv.slice(2);
 
@@ -255,9 +260,12 @@ async function remap(cfg: Config, from: string, to: string | null) {
     const file = path.join(dir, name);
     const [mapped, url = ""] = ((await readText(file)) ?? "").split("\n");
     if (mapped.trim() !== from || (url.trim() || cfg.url) !== cfg.url) continue;
-    if (to) await writeFile(file, `${to}\n${cfg.url}\n`, { mode: 0o600 });
-    else await removeFile(file, { force: true });
+    if (to) {
+      await writeFile(file, `${to}\n${cfg.url}\n`, { mode: 0o600 });
+      await chmod(file, 0o600);
+    } else await removeFile(file, { force: true });
   }
+  await chmod(dir, 0o700).catch(() => {});
 }
 
 async function mv(argv: string[]) {
@@ -454,13 +462,14 @@ async function collect(abs: string): Promise<Record<string, Uint8Array>> {
   } else {
     const root = await realpath(abs);
     for (const rel of await walk(abs)) {
-      const real = await realpath(path.join(abs, ...rel.split("/"))).catch(() => null);
-      if (!real?.startsWith(root + path.sep)) continue;
-      const data = await readRegular(real, budget);
+      const data = await readRegular(path.join(root, ...rel.split("/")), root, budget);
       if (data) files[rel] = data;
     }
     if (!Object.hasOwn(files, "index.html")) throw new Error(`${abs} has no index.html`);
   }
+  const total = Object.values(files).reduce((n, bytes) => n + bytes.byteLength, 0);
+  if (Object.keys(files).length > MAX_FILES) throw new Error(`more than ${MAX_FILES} files; that's the limit per upload`);
+  if (total > MAX_UPLOAD_BYTES) throw new Error(`the upload is ${(total / 1048576).toFixed(1)} MB; the limit is 30 MB`);
   return files;
 }
 
@@ -475,17 +484,28 @@ async function walk(dir: string, prefix = "", out: string[] = []): Promise<strin
   return out;
 }
 
-async function readRegular(file: string, budget: Budget): Promise<Buffer | null> {
-  const handle = await openFile(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)).catch(() => null);
+const SKIPPABLE = new Set(["ENOENT", "ENOTDIR", "ELOOP", "EMLINK"]);
+
+async function readRegular(file: string, root: string, budget: Budget): Promise<Buffer | null> {
+  const skip = (err: unknown) => {
+    if (SKIPPABLE.has((err as NodeJS.ErrnoException).code ?? "")) return null;
+    throw new Error(`can't read ${file}: ${(err as Error).message}`);
+  };
+  const real = await realpath(file).catch(skip);
+  if (!real?.startsWith(root + path.sep)) return null;
+  const handle = await openFile(real, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)).catch(skip);
   if (!handle) return null;
   try {
-    const st = await handle.stat();
-    if (!st.isFile()) return null;
-    budget.files += 1;
-    budget.bytes += st.size;
-    if (budget.files > MAX_FILES) throw new Error(`more than ${MAX_FILES} files; that's the limit per upload`);
+    const opened = await handle.stat();
+    if (!opened.isFile()) return null;
+    const again = await stat(await realpath(file).catch(() => "")).catch(() => null);
+    if (!again || again.ino !== opened.ino || again.dev !== opened.dev) return null;
+    if (budget.bytes + opened.size > MAX_UPLOAD_BYTES) throw new Error("the upload is over the 30 MB limit");
+    if (++budget.files > MAX_FILES) throw new Error(`more than ${MAX_FILES} files; that's the limit per upload`);
+    const data = await handle.readFile();
+    budget.bytes += data.byteLength;
     if (budget.bytes > MAX_UPLOAD_BYTES) throw new Error("the upload is over the 30 MB limit");
-    return await handle.readFile();
+    return data;
   } finally {
     await handle.close();
   }
@@ -505,12 +525,13 @@ async function readStdin(): Promise<Record<string, Uint8Array>> {
 }
 
 async function collectFile(abs: string, files: Record<string, Uint8Array>, budget: Budget) {
-  const root = await realpath(path.dirname(abs));
-  const main = path.basename(abs);
-  const html = await readRegular(await realpath(abs), budget);
+  const real = await realpath(abs);
+  const root = path.dirname(real);
+  const main = path.basename(real);
+  const html = await readRegular(real, root, budget);
   if (!html) throw new Error(`can't read ${abs}`);
   files["index.html"] = html;
-  const seen = new Set(["index.html", main]);
+  const tried = new Set(["index.html", main]);
   const queue: [string, Uint8Array][] = [[main, html]];
   while (queue.length) {
     const [rel, bytes] = queue.shift()!;
@@ -519,21 +540,22 @@ async function collectFile(abs: string, files: Record<string, Uint8Array>, budge
     const text = new TextDecoder().decode(bytes);
     let from = path.posix.dirname(rel);
     if (ext !== ".css") {
-      const base = text.match(/<base\s[^>]*href\s*=\s*["']?([^"'\s>]+)/i)?.[1];
-      if (base && /^([a-z][a-z0-9+.-]*:|\/)/i.test(base)) continue;
-      if (base) from = path.posix.join(from, base.endsWith("/") ? base : path.posix.dirname(base));
+      const rawBase = text.match(/<base\s[^>]*href\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/i)?.slice(1).find((v) => v !== undefined);
+      if (rawBase !== undefined) {
+        const base = cleanRef(rawBase);
+        if (base === null) continue;
+        from = path.posix.join(from, base.endsWith("/") || base === "" ? base : path.posix.dirname(base));
+      }
     }
     for (const ref of localRefs(text, ext === ".css")) {
-      if (ref.includes("\\")) continue;
       const target = path.posix.normalize(path.posix.join(from, ref.endsWith("/") ? `${ref}index.html` : ref));
       if (target === main && main !== "index.html") files[main] = html;
       const candidates = path.posix.extname(target) ? [target] : [target, `${target}.html`, `${target}/index.html`];
       for (const candidate of candidates) {
-        if (seen.has(candidate) || candidate.startsWith("../") || candidate.split("/").some((seg) => seg.startsWith("."))) continue;
-        seen.add(candidate);
-        const real = await realpath(path.join(root, ...candidate.split("/"))).catch(() => null);
-        if (!real?.startsWith(root + path.sep)) continue;
-        const data = await readRegular(real, budget);
+        if (Object.hasOwn(files, candidate) || candidate === main) break;
+        if (tried.has(candidate) || candidate.startsWith("../") || candidate.split("/").some((seg) => seg.startsWith("."))) continue;
+        tried.add(candidate);
+        const data = await readRegular(path.join(root, ...candidate.split("/")), root, budget);
         if (!data) continue;
         files[candidate] = data;
         queue.push([candidate, data]);
@@ -543,16 +565,21 @@ async function collectFile(abs: string, files: Record<string, Uint8Array>, budge
   }
 }
 
+function cleanRef(raw: string): string | null {
+  const ref = decodeEntities(raw).trim().replace(/[?#].*$/, "");
+  if (/^([a-z][a-z0-9+.-]*:|\/)/i.test(ref) || ref.includes("\\")) return null;
+  try {
+    return decodeURIComponent(ref);
+  } catch {
+    return ref;
+  }
+}
+
 function localRefs(text: string, css: boolean): string[] {
   const refs: string[] = [];
   const add = (raw = "") => {
-    const ref = decodeEntities(raw).trim().replace(/[?#].*$/, "");
-    if (!ref || /^([a-z][a-z0-9+.-]*:|\/)/i.test(ref)) return;
-    try {
-      refs.push(decodeURIComponent(ref));
-    } catch {
-      refs.push(ref);
-    }
+    const ref = cleanRef(raw);
+    if (ref) refs.push(ref);
   };
   const value = (m: RegExpMatchArray) => m[2] ?? m[3] ?? m[4];
   for (const m of text.matchAll(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi)) add(m[2]);
