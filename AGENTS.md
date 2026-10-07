@@ -40,7 +40,7 @@ There are no automated tests. Verify changes against `bun run dev` with the CLI 
 - Uploaded files are served byte-for-byte. No sanitizing or CSP sandboxing; that's the point.
 - R2 layout: `meta/<slug>.json` holds the title and the version list (`files` maps path → sha256), plus `customMetadata` so `/` needs one `list()`. File bytes live at `blobs/<slug>/<sha256>`. Versions are append-only and immutable; meta writes use conditional puts.
 - URL space: `/api/*`, `/login`, `/robots.txt`, `/<slug>/` latest, `/<slug>/v/<n>/` pinned, `/<slug>/_history`. Slugs `api` and `login`, and file paths starting with `v/` or `_history`, are reserved.
-- The version switcher is only injected for `Sec-Fetch-Dest: document` without `?raw`. API clients and `tack get` always get the exact bytes.
+- The version switcher is only injected into docs with more than one version, for `Sec-Fetch-Dest: document`, without `?raw`. API clients and `tack get` always get the exact bytes. Its ETag includes `BAR_REV` (a hash of `BAR_JS`) so redesigns aren't hidden behind cached 304s.
 - Workers Free allows 1,000 R2 calls per request, so uploads are capped at 200 files (worker and CLI). Use `Object.hasOwn` for lookups keyed by paths or extensions.
 - The CLI runs with `bun --no-env-file` so a project's `.env` can't redirect the token. It only sends the token to its configured origin, which must be https (http only for localhost). Folder uploads never follow symlinks.
 - Every response is `cache-control: ... no-transform`; without it Cloudflare's bot detection injects a script into HTML and docs stop being byte-for-byte.
