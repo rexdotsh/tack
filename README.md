@@ -1,4 +1,4 @@
-# tack
+<img src=".github/banner.png" alt="tack: let your agents pin HTML to your own Cloudflare" width="100%">
 
 Private HTML docs for agents, on your own Cloudflare.
 
