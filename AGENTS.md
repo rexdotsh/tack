@@ -42,5 +42,6 @@ There are no automated tests. Verify changes against `bun run dev` with the CLI 
 - URL space: `/api/*`, `/login`, `/robots.txt`, `/<slug>/` latest, `/<slug>/v/<n>/` pinned, `/<slug>/_history`. Slugs `api` and `login`, and file paths starting with `v/` or `_history`, are reserved.
 - The version switcher is only injected for `Sec-Fetch-Dest: document` without `?raw`. API clients and `tack get` always get the exact bytes.
 - Workers Free allows 1,000 R2 calls per request, so uploads are capped at 200 files (worker and CLI). Use `Object.hasOwn` for lookups keyed by paths or extensions.
-- The CLI runs with `bun --no-env-file` so a project's `.env` can't redirect the token. It only sends the token to its configured origin. Folder uploads never follow symlinks.
+- The CLI runs with `bun --no-env-file` so a project's `.env` can't redirect the token. It only sends the token to its configured origin, which must be https (http only for localhost). Folder uploads never follow symlinks.
+- Every response is `cache-control: ... no-transform`; without it Cloudflare's bot detection injects a script into HTML and docs stop being byte-for-byte.
 - Workers Builds needs the `BUN_VERSION` build variable (≥ 1.4) to read `bun.lock`.

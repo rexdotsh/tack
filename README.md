@@ -19,7 +19,7 @@ Docs are secret links: anyone with a link can open it, and links carry a random 
    tack open     # prints the link that unlocks the doc list in your browser
    ```
 
-   On another machine: `tack setup --token <token>` (the token is in `~/.config/tack/config.json`), or set `TACK_TOKEN`.
+   On another machine: `tack setup --token <token>` (the token is in `~/.config/tack/config.json`), or set `TACK_TOKEN`. If the token leaks, `tack setup --rotate` replaces it (and the unlock link).
 
 ## CLI
 
