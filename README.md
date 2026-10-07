@@ -5,7 +5,7 @@ Private HTML docs for agents, on your own Cloudflare.
 An agent runs `tack upload plan.html` and replies with a link. Uploading again adds a version under the same link, and open tabs update live.
 
 - **Secret links.** Anyone with a link can read it; nobody can guess one.
-- **Versions.** `/slug/` is the latest, `/slug/v/2/` is pinned, plus `/_history` and `/_diff`.
+- **Versions.** `/id` is the latest, `/id/v/2` is pinned, plus `/_history` and `/_diff`.
 - **Anything goes.** Served byte-for-byte: scripts, assets, multi-page folders.
 - **Free plan friendly.** One Worker, one R2 bucket, one Durable Object.
 

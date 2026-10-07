@@ -10,9 +10,9 @@ description: Use when the user wants an HTML write-up (plan, spec, report, findi
 ## Publish a new doc
 
 0. If the doc might already exist (same subject as earlier work), check first with `tack list --match "<words from the title>" --json`. Update an existing doc only when it's clearly the same document (same subject, or the one the user means). If several match or you're unsure, ask the user which one, or create a new doc.
-1. Write a self-contained HTML file. Inline CSS/JS is fine, as are external https assets. Give it a good `<title>`; it becomes the doc title and the start of the slug.
+1. Write a self-contained HTML file. Inline CSS/JS is fine, as are external https assets. Give it a good `<title>`; it becomes the doc title.
    Local images, CSS and pages that the file references with relative paths (`img/chart.png`, `details.html`) are uploaded with it automatically, as long as they're in its folder or below. You can also upload a whole folder with an `index.html`.
-2. Run `tack upload <file-or-folder> --new --json`. Don't pass your own `--slug` for a new doc; the generated one has a random part that keeps the link private.
+2. Run `tack upload <file-or-folder> --new --json`. Don't pass your own `--slug` for a new doc; the generated one is random, which is what keeps the link private.
    For a single page you don't need a file: pipe it in with `tack upload - --new --json <<'EOF' ... EOF`. Updates work the same way with `tack upload - --slug <slug>`.
 3. Reply with the receipt's `url`. It's only published once the receipt has `"ok": true`.
 
