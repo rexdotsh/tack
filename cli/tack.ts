@@ -19,7 +19,7 @@ Usage:
   tack list [--json]
   tack open                         print the link that unlocks the doc list in a browser
   tack rm <slug>
-  tack setup [--token <t>]          no token: create one and set it on the Worker via wrangler
+  tack setup [--token <t>|--rotate] save + set the token on the Worker (--token: just save; --rotate: new token)
 
 upload:
   A file is published as the doc's index.html. A folder must contain index.html;
@@ -196,12 +196,18 @@ async function open(argv: string[]) {
 }
 
 async function setup(argv: string[]) {
-  const { values: o } = parseArgs({ args: argv, options: { ...common, token: { type: "string" } } });
+  const { values: o } = parseArgs({
+    args: argv,
+    options: { ...common, token: { type: "string" }, rotate: { type: "boolean" } },
+  });
   const current = ((await readJson(CONFIG_FILE)) ?? {}) as Partial<Config>;
-  const url = (o.url || process.env.TACK_URL || current.url || DEFAULT_URL).replace(/\/+$/, "");
-  const token = o.token || current.token || Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
+  const url = instanceUrl(o.url || process.env.TACK_URL || current.url || DEFAULT_URL);
+  const token =
+    o.token || (!o.rotate && current.token) || Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
 
-  if (!o.token) {
+  if (o.token) {
+    await connect({ url, token }, 1);
+  } else {
     console.log("setting TACK_TOKEN on the Worker with wrangler...");
     const proc = Bun.spawn(["bunx", "wrangler", "secret", "put", "TACK_TOKEN"], {
       cwd: path.join(import.meta.dir, ".."),
@@ -209,21 +215,28 @@ async function setup(argv: string[]) {
       stdout: "inherit",
       stderr: "inherit",
     });
-    if ((await proc.exited) !== 0) throw new Error("wrangler failed; is the Worker deployed and are you logged in (`bunx wrangler login`)?");
+    if ((await proc.exited) !== 0) {
+      throw new Error(
+        "wrangler failed. Is the Worker deployed and are you logged in (`bunx wrangler login`)? With several Cloudflare accounts, set CLOUDFLARE_ACCOUNT_ID.",
+      );
+    }
   }
 
   await mkdir(CONFIG_DIR, { recursive: true, mode: 0o700 });
   await writeFile(CONFIG_FILE, `${JSON.stringify({ ...(url !== DEFAULT_URL && { url }), token }, null, 2)}\n`, { mode: 0o600 });
   await chmod(CONFIG_FILE, 0o600);
   console.log(`saved ${CONFIG_FILE}`);
+  if (!o.token) await connect({ url, token }, 6);
+}
 
+async function connect(cfg: Config, tries: number) {
   for (let attempt = 1; ; attempt++) {
     try {
-      const { docs } = await api<{ docs: DocSummary[] }>({ url, token }, "/api/docs");
-      console.log(`connected to ${url} (${docs.length} doc${docs.length === 1 ? "" : "s"}). Run \`tack open\` to unlock the doc list.`);
+      const { docs } = await api<{ docs: DocSummary[] }>(cfg, "/api/docs");
+      console.log(`connected to ${cfg.url} (${docs.length} doc${docs.length === 1 ? "" : "s"}). Run \`tack open\` to unlock the doc list.`);
       return;
     } catch (err) {
-      if (attempt === 6 || !(err instanceof HttpError) || ![401, 503].includes(err.status)) throw err;
+      if (attempt >= tries || !(err instanceof HttpError) || ![401, 503].includes(err.status)) throw err;
       await Bun.sleep(2000);
     }
   }
@@ -232,9 +245,17 @@ async function setup(argv: string[]) {
 async function loadConfig(flagUrl?: string): Promise<Config> {
   const file = ((await readJson(CONFIG_FILE)) ?? {}) as Partial<Config>;
   return {
-    url: (flagUrl || process.env.TACK_URL || file.url || DEFAULT_URL).replace(/\/+$/, ""),
+    url: instanceUrl(flagUrl || process.env.TACK_URL || file.url || DEFAULT_URL),
     token: process.env.TACK_TOKEN || file.token || "",
   };
+}
+
+function instanceUrl(raw: string): string {
+  const url = new URL(raw);
+  if (url.protocol !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) {
+    throw new Error(`${raw}: use https (plain http is only allowed for localhost)`);
+  }
+  return raw.replace(/\/+$/, "");
 }
 
 async function request(cfg: Config, target: string, init: RequestInit = {}): Promise<Response> {
