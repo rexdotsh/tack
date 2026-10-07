@@ -17,13 +17,15 @@ Usage:
   tack upload <file.html|dir> [--slug <slug>] [--new] [--title <t>] [--note <n>] [--json]
   tack get <slug|url> [--v <n>]     print a doc's HTML to stdout
   tack list [--json]
+  tack open                         print the link that unlocks the doc list in a browser
   tack rm <slug>
-  tack setup [--client-id <id> --client-secret <secret>]
+  tack setup [--token <t>]          no token: create one and set it on the Worker via wrangler
 
 upload:
   A file is published as the doc's index.html. A folder must contain index.html;
   everything else in it (images, css, js, more pages) is published alongside it.
   --slug <s>   publish to this slug: creates it, or adds a version if it exists
+               (pick your own and the link is guessable; new docs get a random one)
   --new        always create a new doc (with --slug: fail if the slug is taken)
                with neither, re-uploading the same path updates the same doc
   --title <t>  doc title (default: the page's <title> or first <h1>)
@@ -31,10 +33,10 @@ upload:
   --json       machine-readable receipt
 
 Every command accepts --url <url>. Precedence: --url, $TACK_URL, config file, ${DEFAULT_URL}.
-Config: ${CONFIG_FILE}  (env overrides: TACK_URL, TACK_CLIENT_ID, TACK_CLIENT_SECRET)
+Config: ${CONFIG_FILE}  (env overrides: TACK_URL, TACK_TOKEN)
 `;
 
-type Config = { url: string; clientId: string; clientSecret: string };
+type Config = { url: string; token: string };
 type Receipt = {
   ok: true;
   slug: string;
@@ -57,7 +59,7 @@ class HttpError extends Error {
   }
 }
 
-const commands: Record<string, (argv: string[]) => Promise<void>> = { upload, get, list, rm, setup };
+const commands: Record<string, (argv: string[]) => Promise<void>> = { upload, get, list, open, rm, setup };
 const [cmd, ...rest] = process.argv.slice(2);
 
 if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") {
@@ -186,41 +188,52 @@ async function rm(argv: string[]) {
   console.log(`deleted ${slug}`);
 }
 
-async function setup(argv: string[]) {
-  const { values: o } = parseArgs({
-    args: argv,
-    options: { ...common, "client-id": { type: "string" }, "client-secret": { type: "string" } },
-  });
-  const current = ((await readJson(CONFIG_FILE)) ?? {}) as Partial<Config>;
-  const interactive = Boolean(process.stdin.isTTY);
-  const ask = (question: string, fallback = "", shown = fallback) => {
-    if (!interactive) return fallback;
-    const answer = prompt(shown ? `${question} [${shown}]:` : `${question}:`)?.trim();
-    return answer || fallback;
-  };
-  const url = (o.url || ask("Instance URL", current.url || DEFAULT_URL)).replace(/\/+$/, "");
-  const clientId = o["client-id"] || ask("Access service token Client ID", current.clientId);
-  const clientSecret =
-    o["client-secret"] ||
-    ask("Access service token Client Secret", current.clientSecret, current.clientSecret ? "keep current" : "");
-  if (!clientId || !clientSecret) throw new Error("need a Client ID and Client Secret (--client-id / --client-secret)");
+async function open(argv: string[]) {
+  const { values: o } = parseArgs({ args: argv, options: common });
+  const cfg = await loadConfig(o.url);
+  if (!cfg.token) throw new Error("no token yet (run `tack setup`)");
+  console.log(`${cfg.url}/login?key=${sha256(`${cfg.token}:view`)}`);
+}
 
-  const saved = { ...(url !== DEFAULT_URL && { url }), clientId, clientSecret };
+async function setup(argv: string[]) {
+  const { values: o } = parseArgs({ args: argv, options: { ...common, token: { type: "string" } } });
+  const current = ((await readJson(CONFIG_FILE)) ?? {}) as Partial<Config>;
+  const url = (o.url || process.env.TACK_URL || current.url || DEFAULT_URL).replace(/\/+$/, "");
+  const token = o.token || current.token || Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
+
+  if (!o.token) {
+    console.log("setting TACK_TOKEN on the Worker with wrangler...");
+    const proc = Bun.spawn(["bunx", "wrangler", "secret", "put", "TACK_TOKEN"], {
+      cwd: path.join(import.meta.dir, ".."),
+      stdin: new Blob([token]),
+      stdout: "inherit",
+      stderr: "inherit",
+    });
+    if ((await proc.exited) !== 0) throw new Error("wrangler failed; is the Worker deployed and are you logged in (`bunx wrangler login`)?");
+  }
+
   await mkdir(CONFIG_DIR, { recursive: true, mode: 0o700 });
-  await writeFile(CONFIG_FILE, `${JSON.stringify(saved, null, 2)}\n`, { mode: 0o600 });
+  await writeFile(CONFIG_FILE, `${JSON.stringify({ ...(url !== DEFAULT_URL && { url }), token }, null, 2)}\n`, { mode: 0o600 });
   await chmod(CONFIG_FILE, 0o600);
   console.log(`saved ${CONFIG_FILE}`);
 
-  const { docs } = await api<{ docs: DocSummary[] }>({ url, clientId, clientSecret }, "/api/docs");
-  console.log(`connected to ${url} (${docs.length} doc${docs.length === 1 ? "" : "s"})`);
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const { docs } = await api<{ docs: DocSummary[] }>({ url, token }, "/api/docs");
+      console.log(`connected to ${url} (${docs.length} doc${docs.length === 1 ? "" : "s"}). Run \`tack open\` to unlock the doc list.`);
+      return;
+    } catch (err) {
+      if (attempt === 6 || !(err instanceof HttpError) || ![401, 503].includes(err.status)) throw err;
+      await Bun.sleep(2000);
+    }
+  }
 }
 
 async function loadConfig(flagUrl?: string): Promise<Config> {
   const file = ((await readJson(CONFIG_FILE)) ?? {}) as Partial<Config>;
   return {
     url: (flagUrl || process.env.TACK_URL || file.url || DEFAULT_URL).replace(/\/+$/, ""),
-    clientId: process.env.TACK_CLIENT_ID || file.clientId || "",
-    clientSecret: process.env.TACK_CLIENT_SECRET || file.clientSecret || "",
+    token: process.env.TACK_TOKEN || file.token || "",
   };
 }
 
@@ -229,10 +242,7 @@ async function request(cfg: Config, target: string, init: RequestInit = {}): Pro
   const origin = new URL(cfg.url).origin;
   for (let hop = 0; hop < 5; hop++) {
     const headers = new Headers(init.headers);
-    if (url.origin === origin && cfg.clientId) {
-      headers.set("cf-access-client-id", cfg.clientId);
-      headers.set("cf-access-client-secret", cfg.clientSecret);
-    }
+    if (url.origin === origin && cfg.token) headers.set("authorization", `Bearer ${cfg.token}`);
     let res: Response;
     try {
       res = await fetch(url, { ...init, headers, redirect: "manual" });
@@ -240,18 +250,8 @@ async function request(cfg: Config, target: string, init: RequestInit = {}): Pro
       throw new Error(`could not reach ${url.origin}: ${err instanceof Error ? err.message : String(err)}`);
     }
     const location = res.headers.get("location");
-    if (res.status >= 300 && res.status < 400 && location) {
-      const next = new URL(location, url);
-      if (next.hostname.endsWith(".cloudflareaccess.com") || next.pathname.startsWith("/cdn-cgi/access/")) {
-        throw accessError(cfg);
-      }
-      url = next;
-      continue;
-    }
-    if (res.status === 401 || (res.status === 403 && !res.headers.get("content-type")?.includes("json"))) {
-      throw accessError(cfg);
-    }
-    return res;
+    if (res.status < 300 || res.status >= 400 || !location) return res;
+    url = new URL(location, url);
   }
   throw new Error("too many redirects");
 }
@@ -262,14 +262,6 @@ async function api<T>(cfg: Config, pathname: string, init?: RequestInit): Promis
   if (!body) throw new HttpError(`unexpected HTTP ${res.status} from ${cfg.url}${pathname}`, res.status);
   if (!res.ok || !body.ok) throw new HttpError(body.error || `HTTP ${res.status}`, res.status);
   return body;
-}
-
-function accessError(cfg: Config) {
-  return new Error(
-    cfg.clientId
-      ? "Cloudflare Access rejected the service token. Check the Access app has a Service Auth policy that includes it."
-      : "Cloudflare Access wants a login. Run `tack setup` to add a service token.",
-  );
 }
 
 async function collect(abs: string): Promise<Record<string, Uint8Array>> {
@@ -326,7 +318,7 @@ function makeSlug(base: string): string {
       .slice(0, 40)
       .replace(/-+$/, "") || "doc";
   const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
-  const suffix = Array.from(crypto.getRandomValues(new Uint8Array(4)), (b) => alphabet[b % alphabet.length]).join("");
+  const suffix = Array.from(crypto.getRandomValues(new Uint8Array(10)), (b) => alphabet[b % alphabet.length]).join("");
   return `${stem}-${suffix}`;
 }
 

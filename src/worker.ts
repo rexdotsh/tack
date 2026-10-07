@@ -1,5 +1,6 @@
 interface Env {
   BUCKET: R2Bucket;
+  TACK_TOKEN?: string;
 }
 
 type Version = { n: number; at: string; hash: string; size: number; files: Record<string, string>; note?: string };
@@ -9,32 +10,73 @@ type UploadBody = { files?: Record<string, unknown>; title?: string; note?: stri
 
 const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const MAX_FILES = 200;
-const RESERVED_SLUGS = new Set(["api"]);
+const RESERVED_SLUGS = new Set(["api", "login"]);
 const metaKey = (slug: string) => `meta/${slug}.json`;
 const blobKey = (slug: string, hash: string) => `blobs/${slug}/${hash}`;
 
 export default {
   async fetch(req, env): Promise<Response> {
     const url = new URL(req.url);
+    let res: Response;
     try {
-      if (url.pathname === "/") return await indexPage(env);
-      if (url.pathname === "/api" || url.pathname.startsWith("/api/")) return await api(req, env, url);
-      return await serveDoc(req, env, url);
+      res = await route(req, env, url);
     } catch (err) {
       console.error(err);
-      return text(`tack: internal error: ${err instanceof Error ? err.message : String(err)}`, 500);
+      res = text(`tack: internal error: ${err instanceof Error ? err.message : String(err)}`, 500);
     }
+    const out = new Response(res.body, res);
+    out.headers.set("x-robots-tag", "noindex, nofollow");
+    out.headers.set("referrer-policy", "no-referrer");
+    return out;
   },
 } satisfies ExportedHandler<Env>;
+
+async function route(req: Request, env: Env, url: URL): Promise<Response> {
+  if (url.pathname === "/robots.txt") return text("User-agent: *\nDisallow: /\n");
+  if (url.pathname === "/login") return login(env, url);
+  if (url.pathname === "/") return (await isViewer(req, env)) ? indexPage(env) : locked();
+  if (url.pathname === "/api" || url.pathname.startsWith("/api/")) {
+    if (!env.TACK_TOKEN) return fail(503, "the TACK_TOKEN secret is not set on the Worker (run `tack setup`)");
+    const token = req.headers.get("authorization")?.match(/^Bearer (.+)$/i)?.[1];
+    if (!(await same(token, env.TACK_TOKEN))) return fail(401, "bad or missing token (run `tack setup`)");
+    return api(req, env, url);
+  }
+  return serveDoc(req, env, url);
+}
+
+async function viewKey(env: Env): Promise<string | null> {
+  return env.TACK_TOKEN ? sha256(new TextEncoder().encode(`${env.TACK_TOKEN}:view`)) : null;
+}
+
+async function isViewer(req: Request, env: Env): Promise<boolean> {
+  const key = await viewKey(env);
+  const cookie = req.headers.get("cookie")?.match(/(?:^|;\s*)tack=([^;]*)/)?.[1];
+  return key !== null && (await same(cookie, key));
+}
+
+async function login(env: Env, url: URL): Promise<Response> {
+  const key = await viewKey(env);
+  if (!key || !(await same(url.searchParams.get("key"), key))) return locked();
+  return new Response(null, {
+    status: 302,
+    headers: { location: "/", "set-cookie": `tack=${key}; Max-Age=31536000; Path=/; HttpOnly; Secure; SameSite=Lax` },
+  });
+}
+
+async function same(given: string | null | undefined, expected: string): Promise<boolean> {
+  if (!given) return false;
+  const enc = new TextEncoder();
+  const [a, b] = await Promise.all([
+    crypto.subtle.digest("SHA-256", enc.encode(given)),
+    crypto.subtle.digest("SHA-256", enc.encode(expected)),
+  ]);
+  return crypto.subtle.timingSafeEqual(a, b);
+}
 
 async function api(req: Request, env: Env, url: URL): Promise<Response> {
   const m = url.pathname.match(/^\/api\/docs(?:\/([^/]+))?\/?$/);
   if (!m) return fail(404, "not found");
   const slug = m[1];
-  const isWrite = req.method !== "GET" && req.method !== "HEAD";
-  if (isWrite && req.headers.has("cf-access-authenticated-user-email")) {
-    return fail(403, "writes are only accepted from the Access service token (use the tack CLI)");
-  }
 
   if (!slug) {
     if (req.method !== "GET") return fail(405, "method not allowed");
@@ -53,7 +95,7 @@ async function api(req: Request, env: Env, url: URL): Promise<Response> {
 
 async function upload(req: Request, env: Env, origin: string, slug: string): Promise<Response> {
   if (!SLUG_RE.test(slug) || RESERVED_SLUGS.has(slug)) {
-    return fail(400, "slug must be 1-64 chars of a-z, 0-9 and '-' (not starting/ending with '-'), and not 'api'");
+    return fail(400, "slug must be 1-64 chars of a-z, 0-9 and '-' (not starting/ending with '-'), and not 'api' or 'login'");
   }
   const body = await req.json<UploadBody>().catch(() => null);
   if (!body?.files || typeof body.files !== "object") return fail(400, "expected JSON { files: { path: base64 } }");
@@ -361,6 +403,10 @@ function historyPage(meta: Meta): string {
       `<div class="m"><a href="/${meta.slug}/">open latest</a> · ${meta.versions.length} version${meta.versions.length === 1 ? "" : "s"}</div>` +
       `<table><tbody>${rows}</tbody></table>`,
   );
+}
+
+function locked(): Response {
+  return html(page("tack", `<h1>📌 tack</h1><p class="m">Locked. Run <code>tack open</code> for your unlock link.</p>`), 401);
 }
 
 function notFound(message = "Not found.", slug?: string): Response {
