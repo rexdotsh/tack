@@ -274,7 +274,7 @@ async function serveDoc(req: Request, env: Env, url: URL): Promise<Response> {
   const etag = `"${hash.slice(0, 32)}${inject ? `-bar${version.n}of${latestN}` : ""}"`;
   const headers = new Headers({
     "content-type": type,
-    "cache-control": "private, no-cache",
+    "cache-control": "private, no-cache, no-transform",
     etag,
     vary: "sec-fetch-dest",
     "x-tack-slug": slug,
@@ -478,5 +478,5 @@ const fail = (status: number, error: string) => json({ ok: false, error }, statu
 const text = (body: string, status = 200) =>
   new Response(body, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
 const html = (body: string, status = 200) =>
-  new Response(body, { status, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" } });
+  new Response(body, { status, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "private, no-cache, no-transform" } });
 const redirect = (location: string) => new Response(null, { status: 302, headers: { location } });
