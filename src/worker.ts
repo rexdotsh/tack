@@ -15,12 +15,20 @@ type Meta = {
   lastN?: number;
   rev?: number;
   gen?: number;
-  lock?: { reason: string; at: number; to?: string };
+  lock?: { reason: string; at: number; to?: string; from?: string; phase?: "cleanup" };
   versions: Version[];
 };
 type DocSummary = { slug: string; title: string; updatedAt: string; latest: number; versions: number };
 type UploadBody = { files?: Record<string, unknown>; size?: number; title?: string; note?: string; create?: boolean };
-type LiveState = { gen: number; rev: number; ns?: number[]; moved?: string; deleted?: boolean };
+type LiveState = {
+  gen: number;
+  rev: number;
+  ns?: number[];
+  latest?: number;
+  count?: number;
+  moved?: string;
+  deleted?: boolean;
+};
 
 const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const MAX_FILES = 200;
@@ -30,7 +38,10 @@ const HASH_RE = /^[0-9a-f]{64}$/;
 const LOCK_MS = 5 * 60_000;
 const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const newer = (a: LiveState, b: LiveState) => (a.gen ?? 0) - (b.gen ?? 0) || a.rev - b.rev;
-const liveState = (meta: Meta): LiveState => ({ gen: meta.gen ?? 0, rev: meta.rev ?? 0, ns: meta.versions.map((v) => v.n) });
+const liveState = (meta: Meta): LiveState => {
+  const ns = meta.versions.map((v) => v.n);
+  return { gen: meta.gen ?? 0, rev: meta.rev ?? 0, ns, latest: ns.at(-1), count: ns.length };
+};
 const metaKey = (slug: string) => `meta/${slug}.json`;
 const blobKey = (slug: string, hash: string) => `blobs/${slug}/${hash}`;
 
@@ -41,6 +52,14 @@ export class Live extends DurableObject<Env> {
     const state = await this.ctx.storage.get<string>("state");
     if (state) server.send(state);
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async begin(): Promise<number> {
+    const last = (await this.ctx.storage.get<number>("gen")) ?? 0;
+    const stored = await this.ctx.storage.get<string>("state");
+    const gen = Math.max(Date.now(), last + 1, (stored ? (JSON.parse(stored).gen ?? 0) : 0) + 1);
+    await this.ctx.storage.put("gen", gen);
+    return gen;
   }
 
   async notify(state: LiveState) {
@@ -67,6 +86,15 @@ export class Live extends DurableObject<Env> {
 }
 
 const live = (env: Env, slug: string) => env.LIVE.get(env.LIVE.idFromName(slug));
+
+async function nextGen(env: Env, slug: string): Promise<number> {
+  try {
+    return await live(env, slug).begin();
+  } catch (err) {
+    console.error("live begin failed", err);
+    return Date.now();
+  }
+}
 
 async function notify(env: Env, slug: string, state: LiveState) {
   try {
@@ -164,10 +192,13 @@ async function blocked(env: Env, meta: Meta): Promise<string | null> {
   const lock = meta.lock;
   if (!lock) return null;
   if (Date.now() - lock.at < LOCK_MS) return `${meta.slug} is ${lock.reason}; retry in a moment`;
-  if (!lock.to || (await env.BUCKET.head(metaKey(lock.to)))) {
-    return `an earlier ${lock.to ? "rename" : "delete"} of ${meta.slug} didn't finish; run \`tack rm ${meta.slug}\` to clean it up`;
-  }
-  return null;
+  const finish = (slug: string, what: string) => `an earlier ${what} didn't finish; run \`tack rm ${slug}\` to clean it up`;
+  if (lock.from) return finish(meta.slug, `rename from ${lock.from}`);
+  if (!lock.to) return finish(meta.slug, "delete");
+  if (lock.phase === "cleanup") return finish(meta.slug, `rename to ${lock.to}`);
+  const target = await getMeta(env, lock.to);
+  if (!target) return null;
+  return finish(target.lock?.from === meta.slug ? lock.to : meta.slug, `rename to ${lock.to}`);
 }
 
 async function putBlob(req: Request, env: Env, slug: string, hash: string): Promise<Response> {
@@ -210,13 +241,17 @@ async function upload(req: Request, env: Env, origin: string, slug: string): Pro
   const note = body.note?.trim().slice(0, 1000).toWellFormed();
 
   const present = new Set<string>();
+  let lifecycle = "";
   for (let attempt = 0; attempt < 5; attempt++) {
     const now = new Date().toISOString();
     const existing = await env.BUCKET.get(metaKey(slug));
     if (existing && body.create) return fail(409, `slug "${slug}" is already taken`);
     const meta: Meta = existing
       ? await existing.json<Meta>()
-      : { slug, title: slug, createdAt: now, updatedAt: now, gen: Date.now(), versions: [] };
+      : { slug, title: slug, createdAt: now, updatedAt: now, gen: await nextGen(env, slug), versions: [] };
+    const current = existing ? `${meta.gen ?? 0}:${meta.createdAt}` : "new";
+    if (current !== lifecycle) present.clear();
+    lifecycle = current;
     const lock = await blocked(env, meta);
     if (lock) return fail(409, lock);
 
@@ -289,6 +324,9 @@ async function remove(env: Env, slug: string): Promise<Response> {
   if (!obj) return fail(404, `no doc called "${slug}"`);
   const meta = await obj.json<Meta>();
   if (meta.lock && Date.now() - meta.lock.at < LOCK_MS) return fail(409, `${slug} is ${meta.lock.reason}; retry in a moment`);
+  if (meta.lock?.to && meta.lock.phase !== "cleanup" && (await getMeta(env, meta.lock.to))?.lock?.from === slug) {
+    return fail(409, `an unfinished rename left a half-made copy at ${meta.lock.to}; run \`tack rm ${meta.lock.to}\` first, which keeps ${slug}`);
+  }
   if (!(await saveMeta(env, { ...meta, lock: { reason: "being deleted", at: Date.now() } }, { etagMatches: obj.etag }))) {
     return fail(409, `${slug} changed while deleting; retry`);
   }
@@ -341,12 +379,27 @@ async function rename(req: Request, env: Env, origin: string, slug: string): Pro
   const hashes = [...new Set(meta.versions.flatMap((v) => Object.values(v.files)))];
   if (hashes.length > MAX_FILES * 2) return fail(413, `${slug} has too many files to rename`);
 
-  const lockInfo = { reason: `being renamed to ${to}`, at: Date.now(), to };
-  const locked = await saveMeta(env, { ...meta, lock: lockInfo }, { etagMatches: obj.etag });
+  const sourceLock = { reason: `being renamed to ${to}`, at: Date.now(), to };
+  const locked = await saveMeta(env, { ...meta, lock: sourceLock }, { etagMatches: obj.etag });
   if (!locked) return fail(409, `${slug} changed while renaming; retry`);
   const unlock = () => saveMeta(env, meta, { etagMatches: locked.etag }).catch(() => null);
-  const moved: Meta = { ...meta, slug: to, gen: Date.now(), rev: (meta.rev ?? 0) + 1 };
+
+  const moved: Meta = { ...meta, slug: to, gen: await nextGen(env, to), rev: (meta.rev ?? 0) + 1 };
   delete moved.lock;
+  const reserved = await saveMeta(
+    env,
+    { ...moved, lock: { reason: `being renamed from ${slug}`, at: Date.now(), from: slug } },
+    new Headers({ "if-none-match": "*" }),
+  );
+  if (!reserved) {
+    await unlock();
+    return fail(409, `slug "${to}" is already taken`);
+  }
+  const abandon = async () => {
+    await deleteBlobs(env, to);
+    await env.BUCKET.delete(metaKey(to));
+    await unlock();
+  };
   try {
     for (let i = 0; i < hashes.length; i += 4) {
       const batch = await Promise.all(
@@ -359,19 +412,22 @@ async function rename(req: Request, env: Env, origin: string, slug: string): Pro
         }),
       );
       if (batch.includes(false)) {
-        await unlock();
+        await abandon();
         return fail(500, `${slug} is missing stored files; not renamed`);
       }
     }
-    if (!(await saveMeta(env, moved, new Headers({ "if-none-match": "*" })))) {
-      await unlock();
-      return fail(409, `slug "${to}" is already taken`);
+    if (!(await saveMeta(env, moved, { etagMatches: reserved.etag }))) {
+      await abandon();
+      return fail(409, `${to} changed while renaming; retry`);
     }
   } catch (err) {
-    await unlock();
+    await abandon().catch(() => null);
     throw err;
   }
   await notify(env, to, liveState(moved));
+
+  const cleanup = await saveMeta(env, { ...meta, lock: { ...sourceLock, at: Date.now(), phase: "cleanup" } }, { etagMatches: locked.etag });
+  if (!cleanup) return fail(500, `renamed to ${to}, but couldn't clean up ${slug}; run \`tack rm ${slug}\``);
   await deleteBlobs(env, slug);
   await env.BUCKET.delete(metaKey(slug));
   await notify(env, slug, { gen: meta.gen ?? 0, rev: (meta.rev ?? 0) + 1, moved: to });
@@ -531,7 +587,7 @@ const BAR_JS = `(function (d) {
     } catch (_) {}
   }
   var render = function () {
-    if (d.count < 2 && !fresh) {
+    if (d.count < 2) {
       if (host) { host.remove(); host = root = null; }
       return;
     }
@@ -575,18 +631,19 @@ const BAR_JS = `(function (d) {
     if (age) age.textContent = ageText();
   }, 60000);
   var sync = function (s) {
-    var gen = (s && s.gen) || 0;
-    if (!s || gen < d.gen || (gen === d.gen && !(s.rev > d.rev))) return;
-    var reborn = gen > d.gen;
+    if (dead || !s) return;
+    var gen = s.gen || 0;
+    if (gen < d.gen || (gen === d.gen && !(s.rev > d.rev))) return;
+    if (gen > d.gen && d.pinned) { dead = true; return; }
     d.gen = gen; d.rev = s.rev;
     if (s.deleted) { dead = true; return; }
     if (s.moved) { dead = true; return location.replace(location.origin + "/" + s.moved + "/" + (d.pinned ? "v/" + d.n + "/" : "") + d.sub); }
     if (!d.pinned) return location.reload();
-    if (reborn) { dead = true; return; }
     var ns = s.ns || [];
     if (ns.length && ns[ns.length - 1] > d.latest) fresh = true;
     d.latest = ns.length ? ns[ns.length - 1] : d.latest;
     d.count = ns.length;
+    if (!(d.latest > d.n)) fresh = false;
     d.prev = d.next = 0;
     for (var i = 0; i < ns.length; i++) {
       if (ns[i] < d.n) d.prev = ns[i];
@@ -747,7 +804,7 @@ async function diffPage(env: Env, ctx: ExecutionContext, meta: Meta, url: URL): 
   const files = [...new Set([...Object.keys(a.files), ...Object.keys(b.files)])].sort().flatMap((p) => {
     const [x, y] = [a, b].map((v) => (Object.hasOwn(v.files, p) ? v.files[p] : ""));
     if (x === y) return [];
-    const name = textual(p) && x && y && p !== path ? `<a href="?a=${a.n}&b=${b.n}&path=${encodeURIComponent(p)}">${esc(p)}</a>` : esc(p);
+    const name = textual(p) && p !== path ? `<a href="?a=${a.n}&b=${b.n}&path=${encodeURIComponent(p)}">${esc(p)}</a>` : esc(p);
     return [`${name} ${!x ? "added" : !y ? "removed" : "changed"}`];
   });
   const multi = Object.keys(a.files).length > 1 || Object.keys(b.files).length > 1;
@@ -773,7 +830,7 @@ async function diffPage(env: Env, ctx: ExecutionContext, meta: Meta, url: URL): 
 }
 
 type DiffResult = { added: number; removed: number; html: string; partial?: boolean; error?: string };
-const DIFF_REV = 3;
+const DIFF_REV = 4;
 const MAX_DIFF_BYTES = 150_000;
 const MAX_DIFF_LINES = 2000;
 
@@ -795,7 +852,8 @@ async function cachedDiff(
     if (!obj || !("body" in obj)) return null;
     if (obj.size > MAX_DIFF_BYTES) partial = true;
     const text = await obj.text();
-    const lines = isHtml ? textLines(text) : text.split(/\r?\n/).map((l) => l.trimEnd()).filter(Boolean);
+    const lines = isHtml ? textLines(text) : text.split(/\r?\n/);
+    if (!isHtml && lines.at(-1) === "") lines.pop();
     if (lines.length > MAX_DIFF_LINES) partial = true;
     return lines.slice(0, MAX_DIFF_LINES);
   };
