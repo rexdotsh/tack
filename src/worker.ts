@@ -614,6 +614,7 @@ body{margin:0 auto;max-width:880px;padding:40px 20px;font:15px/1.5 ui-sans-serif
 h1{font-size:20px;margin:0}a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
 .m{color:var(--mute);font-size:13px}.crumb{margin:0 0 8px}
 input{width:100%;box-sizing:border-box;margin:16px 0 4px;padding:8px 10px;font:inherit;color:inherit;background:transparent;border:1px solid var(--line);border-radius:8px}
+input:focus,select:focus,button:focus{outline:none;border-color:var(--mute)}
 table{width:100%;border-collapse:collapse;margin-top:12px}td{padding:10px 8px;border-top:1px solid var(--line);vertical-align:top}
 td+td{white-space:nowrap;text-align:right;color:var(--mute);font-size:13px}.note{margin-top:2px}.empty{padding:32px 0;color:var(--mute)}
 .cmp{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:12px 0 6px}
@@ -730,9 +731,10 @@ async function diffPage(env: Env, ctx: ExecutionContext, meta: Meta, url: URL): 
 }
 
 type DiffResult = { added: number; removed: number; html: string; error?: string };
+const DIFF_REV = 2;
 
 async function cachedDiff(env: Env, ctx: ExecutionContext, slug: string, ha: string, hb: string): Promise<DiffResult> {
-  const key = new Request(`https://diff.tack/${ha || "none"}/${hb || "none"}`);
+  const key = new Request(`https://diff.tack/${DIFF_REV}/${ha || "none"}/${hb || "none"}`);
   const hit = await caches.default.match(key);
   if (hit) return hit.json<DiffResult>();
   const read = async (hash: string) => {
@@ -844,9 +846,9 @@ const BLOCK_TAGS =
 function textLines(html: string): string[] {
   const [first, ...rest] = html.split("<!--");
   const uncommented = first + rest.map((p) => (p.includes("-->") ? p.slice(p.indexOf("-->") + 3) : "")).join("");
-  return decodeEntities(stripHidden(uncommented).replace(BLOCK_TAGS, "\n").replace(/<[^<>]*>/g, ""))
+  return decodeEntities(stripHidden(uncommented).replace(BLOCK_TAGS, "\n").replace(/<[^<>]*>/g, " "))
     .split("\n")
-    .map((l) => l.replace(/\s+/g, " ").trim())
+    .map((l) => l.replace(/\s+/g, " ").replace(/ ([.,;:!?)\]}])/g, "$1").replace(/([(\[{]) /g, "$1").trim())
     .filter(Boolean)
     .slice(0, 2000);
 }
@@ -866,33 +868,25 @@ function stripHidden(html: string): string {
   return out + html.slice(last);
 }
 
-const ENTITIES: Record<string, string> = {
-  amp: "&",
-  lt: "<",
-  gt: ">",
-  quot: '"',
-  apos: "'",
-  nbsp: " ",
-  mdash: "—",
-  ndash: "–",
-  hellip: "…",
-  lsquo: "‘",
-  rsquo: "’",
-  ldquo: "“",
-  rdquo: "”",
-  middot: "·",
-  rarr: "→",
-  larr: "←",
-  times: "×",
-};
+const ENTITIES: Record<string, string> = Object.fromEntries(
+  (
+    "amp & lt < gt > quot \" apos ' nbsp \u00a0 ensp \u2002 emsp \u2003 thinsp \u2009 hairsp \u200a zwj \u200d zwnj \u200c " +
+    "mdash — ndash – minus − hellip … middot · bull • laquo « raquo » lsaquo ‹ rsaquo › lsquo ‘ rsquo ’ ldquo “ rdquo ” " +
+    "sbquo ‚ bdquo „ prime ′ Prime ″ larr ← rarr → uarr ↑ darr ↓ harr ↔ lArr ⇐ rArr ⇒ hArr ⇔ times × divide ÷ " +
+    "plusmn ± le ≤ ge ≥ ne ≠ asymp ≈ infin ∞ deg ° micro µ para ¶ sect § copy © reg ® trade ™ euro € pound £ yen ¥ cent ¢ " +
+    "check ✓ cross ✗ star ☆ starf ★ hearts ♥ dagger † Dagger ‡ frac12 ½ frac14 ¼ frac34 ¾ sup2 ² sup3 ³ iexcl ¡ iquest ¿"
+  )
+    .split(" ")
+    .reduce<[string, string][]>((pairs, w, i, all) => (i % 2 ? pairs : [...pairs, [w, all[i + 1]]]), []),
+);
 
 function decodeEntities(s: string): string {
-  return s.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (all, e: string) => {
+  return s.replace(/&(#x[0-9a-f]+|#\d+|[a-z][a-z0-9]*);/gi, (all, e: string) => {
     if (e[0] === "#") {
       const code = e[1] === "x" || e[1] === "X" ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
       return code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : all;
     }
-    return Object.hasOwn(ENTITIES, e) ? ENTITIES[e] : all;
+    return Object.hasOwn(ENTITIES, e) ? ENTITIES[e] : Object.hasOwn(ENTITIES, e.toLowerCase()) ? ENTITIES[e.toLowerCase()] : all;
   });
 }
 
