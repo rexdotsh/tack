@@ -8,6 +8,9 @@
   "preview_urls": false,
   "routes": [{ "pattern": "tack.rex.wf", "custom_domain": true }],
 
+  "build": { "command": "mkdir -p dist && cp cli/tack.ts dist/cli && cp skill/tack/SKILL.md dist/skill.md" },
+  "assets": { "directory": "./dist" },
+
   "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "tack" }],
 
   "durable_objects": { "bindings": [{ "name": "LIVE", "class_name": "Live" }] },

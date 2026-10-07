@@ -36,4 +36,4 @@ To see what changed between versions, fetch `https://tack.rex.wf/<slug>/_diff?a=
 
 `tack list [--match <words>] [--json]`, `tack rm <slug> [--v <n>]`, `tack mv <slug> <new-slug>`, `tack help`. Don't run `tack open`; it's for the user.
 
-Never put the tack token, the config file, or the `tack open` link in a doc or a chat reply. If tack reports a bad or missing token, ask the user to run `tack setup`.
+Never put the tack token, the config file, or the `tack open` link in a doc or a chat reply. If tack reports a bad or missing token, ask the user to run `tack setup`. If `tack` isn't installed, ask the user to install it (`curl -fsSL https://tack.rex.wf/cli`, see the tack README) rather than writing your own uploader.

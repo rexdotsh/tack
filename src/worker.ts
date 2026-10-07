@@ -23,7 +23,7 @@ type LiveState = { rev: number; latest?: number; count?: number; moved?: string;
 
 const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const MAX_FILES = 200;
-const RESERVED_SLUGS = new Set(["api", "login"]);
+const RESERVED_SLUGS = new Set(["api", "login", "cli"]);
 const RESERVED_PATHS = new Set(["v", "_history", "_diff", "_live"]);
 const HASH_RE = /^[0-9a-f]{64}$/;
 const LOCK_MS = 5 * 60_000;

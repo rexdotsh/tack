@@ -1,5 +1,5 @@
 #!/usr/bin/env -S bun --no-env-file
-import { chmod, mkdir, readdir, realpath, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { parseArgs } from "node:util";
@@ -23,6 +23,7 @@ Usage:
   tack open [slug]                  open a doc in your browser; no slug: unlock the doc list
   tack rm <slug> [--v <n>]          delete a doc, or just one version of it
   tack mv <slug> <new-slug>         rename a doc (old links stop working)
+  tack update                       update this CLI (and the skill) from your instance
   tack setup [--token <t>|--rotate] save + set the token on the Worker (--token: just save; --rotate: new token)
 
 upload:
@@ -65,7 +66,7 @@ class HttpError extends Error {
   }
 }
 
-const commands: Record<string, (argv: string[]) => Promise<void>> = { upload, get, list, open, rm, mv, setup };
+const commands: Record<string, (argv: string[]) => Promise<void>> = { upload, get, list, open, rm, mv, update, setup };
 const [cmd, ...rest] = process.argv.slice(2);
 
 if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") {
@@ -297,6 +298,27 @@ async function copy(text: string): Promise<boolean> {
     if ((await proc.exited) === 0) return true;
   }
   return false;
+}
+
+async function update(argv: string[]) {
+  const { values: o } = parseArgs({ args: argv, options: common });
+  const cfg = await loadConfig(o.url);
+  const self = await realpath(Bun.main);
+  if (await stat(path.join(path.dirname(self), "..", ".git")).catch(() => null)) {
+    throw new Error(`${self} is in a git checkout; use git pull instead`);
+  }
+  const skill = path.join(homedir(), ".agents", "skills", "tack", "SKILL.md");
+  const targets: [string, string][] = [["/cli", self]];
+  if ((await lstat(skill).catch(() => null))?.isFile()) targets.push(["/skill.md", skill]);
+  for (const [route, file] of targets) {
+    const res = await request(cfg, route);
+    const body = await res.text();
+    if (!res.ok || (route === "/cli" && !body.startsWith("#!/usr/bin/env"))) throw new Error(`couldn't download ${cfg.url}${route}`);
+    await Bun.write(`${file}.new`, body);
+    if (route === "/cli") await chmod(`${file}.new`, 0o755);
+    await rename(`${file}.new`, file);
+    console.log(`updated ${file}`);
+  }
 }
 
 async function setup(argv: string[]) {

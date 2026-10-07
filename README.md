@@ -23,6 +23,14 @@ tack setup   # creates a token and sets it on the Worker
 tack open    # unlocks the doc list in your browser
 ```
 
+Any other machine with Bun installs from your instance:
+
+```sh
+curl -fsSL https://tack.rex.wf/cli -o ~/.bun/bin/tack && chmod +x ~/.bun/bin/tack
+curl -fsSL https://tack.rex.wf/skill.md --create-dirs -o ~/.agents/skills/tack/SKILL.md
+tack setup --token <token>   # token is in ~/.config/tack/config.json on the first machine
+```
+
 ## CLI
 
 ```
@@ -33,6 +41,7 @@ tack open [slug]
 tack rm <slug> [--v n]
 tack mv <slug> <new-slug>
 tack setup [--token t | --rotate]
+tack update
 ```
 
 ## Dev
