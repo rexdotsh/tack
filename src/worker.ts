@@ -270,8 +270,9 @@ async function serveDoc(req: Request, env: Env, url: URL): Promise<Response> {
 
   const type = contentType(path);
   const inject =
+    meta.versions.length > 1 &&
     type.startsWith("text/html") && !url.searchParams.has("raw") && req.headers.get("sec-fetch-dest") === "document";
-  const etag = `"${hash.slice(0, 32)}${inject ? `-bar${version.n}of${latestN}` : ""}"`;
+  const etag = `"${hash.slice(0, 32)}${inject ? `-${BAR_REV}-${version.n}of${latestN}` : ""}"`;
   const headers = new Headers({
     "content-type": type,
     "cache-control": "private, no-cache, no-transform",
@@ -286,35 +287,49 @@ async function serveDoc(req: Request, env: Env, url: URL): Promise<Response> {
   const obj = await env.BUCKET.get(blobKey(slug, hash));
   if (!obj) return notFound(`Missing blob for ${slug} v${version.n} “${path}”.`, slug);
   const res = new Response(obj.body, { headers });
-  return inject ? withVersionBar(res, { slug, n: version.n, latest: latestN, sub }) : res;
+  return inject ? withVersionBar(res, { slug, n: version.n, latest: latestN, sub, at: version.at, note: version.note ?? "" }) : res;
 }
 
 const BAR_JS = `(function (d) {
   var e = function (s) { return String(s).replace(/[&"'<>]/g, function (c) { return "&#" + c.charCodeAt(0) + ";"; }); };
   var base = "/" + d.slug + "/";
   var href = function (n) { return n === d.latest ? base + d.sub : base + "v/" + n + "/" + d.sub; };
+  var arrow = function (n, label, path) {
+    if (n < 1 || n > d.latest) return "";
+    return '<a class="ar" href="' + e(href(n)) + '" aria-label="' + label + '" title="' + label + '">' +
+      '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="' + path + '"/></svg></a>';
+  };
+  var when = new Date(d.at).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
   var host = document.createElement("tack-bar");
   var root = host.attachShadow({ mode: "closed" });
   root.innerHTML =
     "<style>" +
     ":host{all:initial;position:fixed;right:12px;bottom:12px;z-index:2147483647}" +
-    ".b{display:flex;align-items:center;gap:1px;padding:3px;border-radius:999px;font:500 12px/1 ui-sans-serif,system-ui,sans-serif;" +
-    "color:#e4e4e7;background:rgba(24,24,27,.88);border:1px solid rgba(255,255,255,.14);box-shadow:0 4px 16px rgba(0,0,0,.25);" +
-    "backdrop-filter:blur(6px);opacity:.55;transition:opacity .15s}" +
-    ".b:hover{opacity:1}" +
-    "a,button{all:unset;cursor:pointer;padding:5px 8px;border-radius:999px;color:inherit}" +
-    "a:hover,button:hover{background:rgba(255,255,255,.14)}" +
-    ".off{opacity:.3;pointer-events:none}.old{color:#fbbf24}" +
-    "</style><div class=b>" +
-    "<a class='" + (d.n > 1 ? "" : "off") + "' href='" + e(href(d.n - 1)) + "' title='Previous version'>&lsaquo;</a>" +
-    "<a class='" + (d.n < d.latest ? "old" : "") + "' href='" + e(base + "_history") + "' title='Version history'>v" + d.n + " of " + d.latest + "</a>" +
-    "<a class='" + (d.n < d.latest ? "" : "off") + "' href='" + e(href(d.n + 1)) + "' title='Next version'>&rsaquo;</a>" +
-    "<button title='Hide'>&times;</button></div>";
-  root.querySelector("button").onclick = function () { host.remove(); };
+    "nav{display:flex;align-items:center;height:26px;padding:0 3px;box-sizing:border-box;border-radius:8px;" +
+    "font:500 12px/1 ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-serif;font-variant-numeric:tabular-nums;color:#e5e5e5;" +
+    "background:rgba(17,17,17,.88);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);" +
+    "box-shadow:0 0 0 1px rgba(255,255,255,.08),0 2px 8px rgba(0,0,0,.16)}" +
+    "a{all:unset;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;height:20px;border-radius:5px;color:inherit}" +
+    "a:hover{background:rgba(255,255,255,.1)}a:focus-visible{outline:2px solid #60a5fa}" +
+    ".v{padding:0 6px}.v span{color:#8a8a8a}.old .v b{color:#fbbf24}b{font-weight:500}" +
+    ".ar{width:0;opacity:0;overflow:hidden;color:#a3a3a3;transition:width .2s,opacity .2s}.ar:hover{color:#fff}" +
+    "nav:hover .ar,nav:focus-within .ar{width:20px;opacity:1}@media (hover:none){.ar{width:20px;opacity:1}}" +
+    "svg{width:14px;height:14px;flex:none;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}" +
+    "@media print{:host{display:none}}" +
+    "</style>" +
+    '<nav class="' + (d.n < d.latest ? "old" : "") + '" aria-label="Versions">' +
+    arrow(d.n - 1, "Previous version", "m15 18-6-6 6-6") +
+    '<a class="v" href="' + e(base + "_history") + '" title="' + e("v" + d.n + " · " + when + (d.note ? " · " + d.note : "")) + '">' +
+    "<b>v" + d.n + "</b><span>&thinsp;/&thinsp;" + d.latest + "</span></a>" +
+    arrow(d.n + 1, "Next version", "m9 18 6-6-6-6") +
+    "</nav>";
   document.documentElement.appendChild(host);
 })(__DATA__);`;
+const BAR_REV = [...BAR_JS].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 0).toString(36);
 
-function withVersionBar(res: Response, data: { slug: string; n: number; latest: number; sub: string }): Response {
+type BarData = { slug: string; n: number; latest: number; sub: string; at: string; note: string };
+
+function withVersionBar(res: Response, data: BarData): Response {
   const payload = JSON.stringify(data).replace(/</g, "\\u003c");
   const tag = `<script data-tack>${BAR_JS.replace("__DATA__", () => payload)}</script>`;
   let done = false;
