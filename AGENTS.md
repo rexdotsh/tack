@@ -4,7 +4,7 @@ tack: a private postplan.dev. A Cloudflare Worker + R2 bucket serves versioned H
 
 ## Layout
 
-- `src/worker.ts`: the whole Worker (API, serving, index/history pages, version switcher).
+- `src/worker.ts`: the whole Worker (API, serving, index/history/diff pages, version chip) plus the `Live` Durable Object.
 - `cli/tack.ts`: the whole CLI. Runs directly with Bun, zero dependencies.
 - `skill/tack/SKILL.md`: skill that tells agents how to use the CLI.
 - `wrangler.jsonc`: Worker config. Deployed from the Cloudflare dashboard via GitHub, so this file is the source of truth on every push.
@@ -38,10 +38,23 @@ There are no automated tests. Verify changes against `bun run dev` with the CLI 
 ## Invariants
 
 - Uploaded files are served byte-for-byte. No sanitizing or CSP sandboxing; that's the point.
-- R2 layout: `meta/<slug>.json` holds the title and the version list (`files` maps path → sha256), plus `customMetadata` so `/` needs one `list()`. File bytes live at `blobs/<slug>/<sha256>`. Versions are append-only and immutable; meta writes use conditional puts.
-- URL space: `/api/*`, `/login`, `/robots.txt`, `/<slug>/` latest, `/<slug>/v/<n>/` pinned, `/<slug>/_history`, `/<slug>/_diff`, `/<slug>/_latest` (JSON, polled for live reload). Slugs `api` and `login`, and file paths starting with `v`, `_history`, `_diff` or `_latest`, are reserved.
+- R2 layout: `meta/<slug>.json` holds the title and the version list (`files` maps path → sha256), plus `customMetadata` so `/` needs one `list()`. File bytes live at `blobs/<slug>/<sha256>`. Versions are append-only and immutable; meta writes go through `saveMeta()` (conditional put + throttle retry).
+- Uploads are content-addressed: the CLI POSTs `{ files: { path: sha256 }, size, ... }`; the Worker answers `428 { missing }` for hashes it doesn't have, the CLI PUTs those raw to `/api/docs/<slug>/blobs/<sha256>` (streamed into R2, which verifies the sha256), then POSTs again to commit. The Worker never decodes or hashes file bytes.
+- Blobs are only deleted with their doc (`tack rm <slug>`) or by a rename. Deleting a single version leaves its blobs in place, because a concurrent upload may be reusing them.
+- Rename sets `renamingTo` on the source meta first; uploads and version deletes refuse while it's set. It copies blobs 4 at a time, aborts (and clears the flag) if any is missing, then creates the target meta and deletes the source.
+- URL space: `/api/*`, `/login`, `/robots.txt`, `/<slug>/` latest, `/<slug>/v/<n>/` pinned, `/<slug>/_history`, `/<slug>/_diff`, `/<slug>/_live` (WebSocket). Slugs `api` and `login`, and file paths starting with `v`, `_history`, `_diff` or `_live`, are reserved.
 - Version numbers are never reused: `meta.lastN` remembers the highest ever issued, so deleting a version can't make an old pinned URL show new content. Numbers can have gaps; use neighbours from `meta.versions`, never `n ± 1`.
-- `BAR_JS` is injected into HTML only for `Sec-Fetch-Dest: document` without `?raw`, so API clients and `tack get` always get the exact bytes. It polls `_latest` (backing off to 30s, paused while hidden) and reloads the latest view or flags "new" on pinned views. The visible chip only renders once a doc has more than one version. The ETag hashes `BAR_JS` and its data so script changes aren't hidden behind cached 304s.
+- `BAR_JS` is injected into HTML only for `Sec-Fetch-Dest: document` without `?raw`, so API clients and `tack get` always get the exact bytes. The visible chip only renders once a doc has more than one version. The ETag hashes `BAR_JS` and its data so script changes aren't hidden behind cached 304s. All its URLs are built from `location.origin`, never relative (a doc's `<base>` must not see the slug).
+- Live updates are pushed, never polled: one `Live` Durable Object per slug holds hibernatable WebSockets from open tabs. Upload, version delete and rename call `notify()`, which stores the state and broadcasts it; new sockets get the stored state on connect. Tabs act only when `state.rev` (the meta's `updatedAt`) is newer than the page's, so stale state can't cause reload loops.
+
+## Cost model (Workers Free)
+
+Keep every hot path O(1) in requests and R2 operations, and never poll.
+
+- Page view: 1 Worker request, 1 R2 read (meta). File bytes come from the edge cache (`caches.default`, keyed by content hash) after the first view per colo.
+- Open tab: 2 requests to connect the WebSocket (Worker + Durable Object), then nothing while idle; outgoing messages are free.
+- Identical re-upload: 1 request, 1 R2 read. Changed upload: 2 commits + 1 PUT per new file; existing files are never resent.
+- Diff page: computed once per pair of file hashes and cached; input is capped (400 KB, 5,000 lines, Myers bails past 400 edits, word diffs share a token budget).
 - Workers Free allows 1,000 R2 calls per request, so uploads are capped at 200 files (worker and CLI). Use `Object.hasOwn` for lookups keyed by paths or extensions.
 - The CLI runs with `bun --no-env-file` so a project's `.env` can't redirect the token. It only sends the token to its configured origin, which must be https (http only for localhost). Folder uploads never follow symlinks.
 - Every response is `cache-control: ... no-transform`; without it Cloudflare's bot detection injects a script into HTML and docs stop being byte-for-byte.

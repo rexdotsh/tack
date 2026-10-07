@@ -9,7 +9,7 @@ Docs are secret links: anyone with a link can open it, and links carry a random 
 ## Deploy
 
 1. **R2**: create a bucket named `tack` (dashboard → R2, or `bunx wrangler r2 bucket create tack`).
-2. **Worker**: Workers & Pages → Create → Import a repository → this repo. Deploy command: `bunx wrangler deploy`. Under Settings → Build → Variables, set `BUN_VERSION` = `1.4.0` (the build image defaults to Bun 1.2, which can't read `bun.lock`). `wrangler.jsonc` attaches the `tack.rex.wf` custom domain.
+2. **Worker**: Workers & Pages → Create → Import a repository → this repo. Deploy command: `bunx wrangler deploy`. Under Settings → Build → Variables, set `BUN_VERSION` = `1.4.0` (the build image defaults to Bun 1.2, which can't read `bun.lock`). `wrangler.jsonc` attaches the `tack.rex.wf` custom domain and creates the Durable Object used for live updates.
 3. **Token + CLI**:
 
    ```sh
@@ -34,7 +34,7 @@ tack rm <slug> [--v 2]                           # delete a doc, or one version
 tack mv <slug> <new-slug>                        # rename (old links stop working)
 ```
 
-A single `.html` file also brings along the local images, CSS and pages it references (from its own folder down). Open docs reload themselves when a new version lands.
+A single `.html` file also brings along the local images, CSS and pages it references (from its own folder down). Re-uploads only send files that changed. Open docs update live over a WebSocket when a new version lands.
 
 `TACK_URL`, `TACK_TOKEN` and `--url` override the config (`.env` files are ignored). Uploads are capped at 200 files and 30 MB; symlinks and dotfiles in folders are skipped. A custom `--slug` makes the link guessable.
 
