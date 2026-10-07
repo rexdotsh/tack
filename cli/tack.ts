@@ -1,5 +1,5 @@
 #!/usr/bin/env -S bun --no-env-file
-import { chmod, mkdir, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readdir, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { parseArgs } from "node:util";
@@ -17,13 +17,15 @@ Usage:
   tack upload <file.html|dir> [--slug <slug>] [--new] [--title <t>] [--note <n>] [--json]
   tack get <slug|url> [--v <n>]     print a doc's HTML to stdout
   tack list [--json]
-  tack open                         print the link that unlocks the doc list in a browser
-  tack rm <slug>
+  tack open [slug]                  open a doc in your browser; no slug: unlock the doc list
+  tack rm <slug> [--v <n>]          delete a doc, or just one version of it
+  tack mv <slug> <new-slug>         rename a doc (old links stop working)
   tack setup [--token <t>|--rotate] save + set the token on the Worker (--token: just save; --rotate: new token)
 
 upload:
-  A file is published as the doc's index.html. A folder must contain index.html;
-  everything else in it (images, css, js, more pages) is published alongside it.
+  A file is published as the doc's index.html, along with the local images, css
+  and pages it references (from its own folder down). A folder must contain
+  index.html; everything in it is published.
   --slug <s>   publish to this slug: creates it, or adds a version if it exists
                (pick your own and the link is guessable; new docs get a random one)
   --new        always create a new doc (with --slug: fail if the slug is taken)
@@ -59,7 +61,7 @@ class HttpError extends Error {
   }
 }
 
-const commands: Record<string, (argv: string[]) => Promise<void>> = { upload, get, list, open, rm, setup };
+const commands: Record<string, (argv: string[]) => Promise<void>> = { upload, get, list, open, rm, mv, setup };
 const [cmd, ...rest] = process.argv.slice(2);
 
 if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") {
@@ -129,10 +131,16 @@ async function upload(argv: string[]) {
   await Bun.write(mapFile, `${receipt.slug}\n`);
 
   const updateCommand = `tack upload ${shellQuote(abs)} --slug ${receipt.slug}`;
-  if (o.json) return printJson({ ...receipt, path: abs, updateCommand });
+  const extras = Object.keys(files).filter((p) => p !== "index.html");
+  if (o.json) return printJson({ ...receipt, path: abs, files: Object.keys(files), updateCommand });
   const status = receipt.unchanged ? "unchanged" : receipt.version === 1 ? "new doc" : "new version";
-  console.log(receipt.url);
+  const copied = process.stdout.isTTY && (await copy(receipt.url));
+  console.log(`${receipt.url}${copied ? "  (copied)" : ""}`);
   console.log(`  v${receipt.version} (${status}) · pinned: ${receipt.versionUrl}`);
+  if (extras.length && (await stat(abs)).isFile()) {
+    const shown = extras.slice(0, 5).join(", ");
+    console.log(`  + ${shown}${extras.length > 5 ? `, and ${extras.length - 5} more` : ""}`);
+  }
   if (remembered && !receipt.unchanged) {
     console.log("  (updated the doc this path was last uploaded to; pass --new for a separate doc)");
   }
@@ -179,20 +187,75 @@ async function list(argv: string[]) {
 }
 
 async function rm(argv: string[]) {
-  const { values: o, positionals } = parseArgs({ args: argv, allowPositionals: true, options: common });
-  if (positionals.length !== 1) throw new Error("usage: tack rm <slug>");
+  const { values: o, positionals } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    options: { ...common, v: { type: "string" } },
+  });
+  if (positionals.length !== 1) throw new Error("usage: tack rm <slug> [--v n]");
   const cfg = await loadConfig(o.url);
   const slug = positionals[0];
-  await api(cfg, `/api/docs/${encodeURIComponent(slug)}`, { method: "DELETE" });
-  if (o.json) return printJson({ ok: true, slug, deleted: true });
-  console.log(`deleted ${slug}`);
+  const target = `/api/docs/${encodeURIComponent(slug)}${o.v ? `/v/${Number(o.v)}` : ""}`;
+  const res = await api<{ latest?: number }>(cfg, target, { method: "DELETE" });
+  if (o.json) return printJson(res);
+  console.log(o.v ? `deleted ${slug} v${o.v} (latest is now v${res.latest})` : `deleted ${slug}`);
+}
+
+async function mv(argv: string[]) {
+  const { values: o, positionals } = parseArgs({ args: argv, allowPositionals: true, options: common });
+  if (positionals.length !== 2) throw new Error("usage: tack mv <slug> <new-slug>");
+  const cfg = await loadConfig(o.url);
+  const [from, to] = positionals;
+  const res = await api<{ slug: string; url: string }>(cfg, `/api/docs/${encodeURIComponent(from)}/rename`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ to }),
+  });
+  const dir = path.join(CONFIG_DIR, "paths");
+  for (const name of await readdir(dir).catch(() => [])) {
+    const file = path.join(dir, name);
+    if ((await readText(file))?.trim() === from) await Bun.write(file, `${res.slug}\n`);
+  }
+  if (o.json) return printJson(res);
+  console.log(res.url);
 }
 
 async function open(argv: string[]) {
-  const { values: o } = parseArgs({ args: argv, options: common });
+  const { values: o, positionals } = parseArgs({ args: argv, allowPositionals: true, options: common });
   const cfg = await loadConfig(o.url);
-  if (!cfg.token) throw new Error("no token yet (run `tack setup`)");
-  console.log(`${cfg.url}/login?key=${sha256(`${cfg.token}:view`)}`);
+  const ref = positionals[0];
+  let target: string;
+  if (ref) target = /^https?:\/\//i.test(ref) ? ref : `${cfg.url}/${ref.replace(/^\/+|\/+$/g, "")}/`;
+  else if (cfg.token) target = `${cfg.url}/login?key=${sha256(`${cfg.token}:view`)}`;
+  else throw new Error("no token yet (run `tack setup`)");
+  console.log(target);
+  const launcher =
+    process.platform === "darwin"
+      ? ["open"]
+      : process.platform === "win32"
+        ? ["cmd", "/c", "start", ""]
+        : process.env.DISPLAY || process.env.WAYLAND_DISPLAY
+          ? ["xdg-open"]
+          : null;
+  if (launcher && Bun.which(launcher[0])) Bun.spawn([...launcher, target], { stdout: "ignore", stderr: "ignore" }).unref();
+}
+
+async function copy(text: string): Promise<boolean> {
+  const candidates =
+    process.platform === "darwin"
+      ? [["pbcopy"]]
+      : process.platform === "win32"
+        ? [["clip"]]
+        : [
+            ...(process.env.WAYLAND_DISPLAY ? [["wl-copy"]] : []),
+            ...(process.env.DISPLAY ? [["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]] : []),
+          ];
+  for (const cmd of candidates) {
+    if (!Bun.which(cmd[0])) continue;
+    const proc = Bun.spawn(cmd, { stdin: new Blob([text]), stdout: "ignore", stderr: "ignore" });
+    if ((await proc.exited) === 0) return true;
+  }
+  return false;
 }
 
 async function setup(argv: string[]) {
@@ -291,7 +354,7 @@ async function collect(abs: string): Promise<Record<string, Uint8Array>> {
   const files: Record<string, Uint8Array> = Object.create(null);
   if (st.isFile()) {
     if (!/\.html?$/i.test(abs)) throw new Error("upload an .html file, or a folder containing index.html");
-    files["index.html"] = await Bun.file(abs).bytes();
+    await collectFile(abs, files);
   } else {
     for await (const rel of new Bun.Glob("**").scan({ cwd: abs, onlyFiles: true })) {
       const key = rel.split(path.sep).join("/");
@@ -305,6 +368,53 @@ async function collect(abs: string): Promise<Record<string, Uint8Array>> {
   const total = Object.values(files).reduce((n, bytes) => n + bytes.byteLength, 0);
   if (total > MAX_UPLOAD_BYTES) throw new Error(`upload is ${(total / 1048576).toFixed(1)} MB; the limit is 30 MB`);
   return files;
+}
+
+async function collectFile(abs: string, files: Record<string, Uint8Array>) {
+  const root = path.dirname(abs);
+  const main = path.basename(abs);
+  const html = await Bun.file(abs).bytes();
+  files["index.html"] = html;
+  const seen = new Set(["index.html", main]);
+  const queue: [string, Uint8Array][] = [[main, html]];
+  while (queue.length) {
+    const [rel, bytes] = queue.shift()!;
+    const ext = path.extname(rel).toLowerCase();
+    if (![".html", ".htm", ".css"].includes(ext)) continue;
+    for (const ref of localRefs(new TextDecoder().decode(bytes), ext === ".css")) {
+      const target = path.posix.normalize(path.posix.join(path.posix.dirname(rel), ref));
+      if (target === main && main !== "index.html") files[main] = html;
+      if (seen.has(target) || target.startsWith("../") || target.split("/").some((seg) => seg.startsWith("."))) continue;
+      seen.add(target);
+      const full = path.join(root, ...target.split("/"));
+      if (!(await lstat(full).catch(() => null))?.isFile()) continue;
+      const data = await Bun.file(full).bytes();
+      files[target] = data;
+      queue.push([target, data]);
+    }
+  }
+}
+
+function localRefs(text: string, css: boolean): string[] {
+  const refs: string[] = [];
+  const add = (raw = "") => {
+    const ref = raw.trim().replace(/[?#].*$/, "");
+    if (!ref || /^([a-z][a-z0-9+.-]*:|\/)/i.test(ref)) return;
+    try {
+      refs.push(decodeURIComponent(ref));
+    } catch {
+      refs.push(ref);
+    }
+  };
+  for (const m of text.matchAll(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi)) add(m[2]);
+  for (const m of text.matchAll(/@import\s+(['"])([^'"]+)\1/gi)) add(m[2]);
+  if (!css) {
+    for (const m of text.matchAll(/\s(?:src|href|poster)\s*=\s*(["'])(.*?)\1/gi)) add(m[2]);
+    for (const m of text.matchAll(/\ssrcset\s*=\s*(["'])(.*?)\1/gi)) {
+      for (const part of m[2].split(",")) add(part.trim().split(/\s+/)[0]);
+    }
+  }
+  return refs;
 }
 
 function extractTitle(html: string): string {
