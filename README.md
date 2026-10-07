@@ -27,9 +27,10 @@ Docs are secret links: anyone with a link can open it, and links carry a random 
 tack upload plan.html                            # new doc, prints (and copies) the link
 tack upload plan.html --note "tightened scope"   # same path again: new version
 tack upload ./report/                            # folder with index.html + assets
+cat page.html | tack upload -                    # one page from stdin
 tack get <slug> --v 2                            # print the exact HTML
 tack open <slug>                                 # open in your browser
-tack list
+tack list --match "q3 plan"                      # find docs by title or slug
 tack rm <slug> [--v 2]                           # delete a doc, or one version
 tack mv <slug> <new-slug>                        # rename (old links stop working)
 ```

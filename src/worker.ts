@@ -484,15 +484,23 @@ const BAR_JS = `(function (d) {
   var e = function (s) { return String(s).replace(/[&"'<>]/g, function (c) { return "&#" + c.charCodeAt(0) + ";"; }); };
   var base = location.origin + "/" + d.slug + "/";
   var href = function (n) { return n === d.latest ? base + d.sub : base + "v/" + n + "/" + d.sub; };
+  var ago = function (iso) {
+    var s = (Date.now() - new Date(iso).getTime()) / 1000;
+    if (s < 60) return "just now";
+    if (s < 3600) return Math.floor(s / 60) + "m ago";
+    if (s < 86400) return Math.floor(s / 3600) + "h ago";
+    if (s < 604800) return Math.floor(s / 86400) + "d ago";
+    return new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  };
   var arrow = function (n, label, path) {
     if (!n) return "";
     return '<a class="ar" href="' + e(href(n)) + '" aria-label="' + label + '" title="' + label + '">' +
       '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="' + path + '"/></svg></a>';
   };
   var when = new Date(d.at).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
-  var host, root;
-  var render = function (showNew) {
-    if (d.count < 2 && !showNew) return;
+  var dead = false, fresh = false, tries = 0, ws = null, host, root;
+  var render = function () {
+    if (d.count < 2 && !fresh) return;
     if (!host) {
       host = document.createElement("tack-bar");
       root = host.attachShadow({ mode: "closed" });
@@ -505,25 +513,28 @@ const BAR_JS = `(function (d) {
       "font:500 12px/1 ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-serif;font-variant-numeric:tabular-nums;color:#e5e5e5;" +
       "background:rgba(17,17,17,.88);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);" +
       "box-shadow:0 0 0 1px rgba(255,255,255,.08),0 2px 8px rgba(0,0,0,.16)}" +
-      "a{all:unset;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;height:20px;border-radius:5px;color:inherit}" +
+      "a{all:unset;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;height:20px;border-radius:5px;color:inherit;white-space:nowrap}" +
       "a:hover{background:rgba(255,255,255,.1)}a:focus-visible{outline:2px solid #60a5fa}" +
       ".v{padding:0 6px}.v span{color:#8a8a8a}.old .v b{color:#fbbf24}b{font-weight:500}" +
       ".nw{padding:0 6px;color:#4ade80;font-weight:600}" +
-      ".ar{width:0;opacity:0;overflow:hidden;color:#a3a3a3;transition:width .2s,opacity .2s}.ar:hover{color:#fff}" +
-      "nav:hover .ar,nav:focus-within .ar{width:20px;opacity:1}@media (hover:none){.ar{width:20px;opacity:1}}" +
+      ".ar,.ch{opacity:0;overflow:hidden;color:#a3a3a3;transition:max-width .2s,width .2s,opacity .2s,padding .2s}" +
+      ".ar{width:0}.ch{max-width:0}.ar:hover,.ch:hover{color:#fff}" +
+      "nav:hover .ar,nav:focus-within .ar{width:20px;opacity:1}nav:hover .ch,nav:focus-within .ch{max-width:72px;padding:0 6px;opacity:1}" +
+      "@media (hover:none){.ar{width:20px;opacity:1}.ch{max-width:72px;padding:0 6px;opacity:1}}" +
       "svg{width:14px;height:14px;flex:none;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}" +
       "@media print{:host{display:none}}" +
       "</style>" +
       '<nav class="' + (d.n < d.latest ? "old" : "") + '" aria-label="Versions">' +
       arrow(d.prev, "Previous version", "m15 18-6-6 6-6") +
       '<a class="v" href="' + e(base + "_history") + '" title="' + e("v" + d.n + " · " + when + (d.note ? " · " + d.note : "")) + '">' +
-      "<b>v" + d.n + "</b><span>&thinsp;/&thinsp;" + d.latest + "</span></a>" +
+      "<b>v" + d.n + "</b><span>&thinsp;" + (d.n < d.latest ? "/&thinsp;" + d.latest : "·&thinsp;" + ago(d.at)) + "</span></a>" +
       arrow(d.next, "Next version", "m9 18 6-6-6-6") +
-      (showNew ? '<a class="nw" href="' + e(base + d.sub) + '" title="Open v' + d.latest + '">new</a>' : "") +
+      (d.prev ? '<a class="ch" href="' + e(base + "_diff?a=" + d.prev + "&b=" + d.n) + '" title="What changed in v' + d.n + '">changes</a>' : "") +
+      (fresh && d.latest > d.n ? '<a class="nw" href="' + e(base + d.sub) + '" title="Open v' + d.latest + '">new</a>' : "") +
       "</nav>";
   };
-  render(false);
-  var dead = false, fresh = false, tries = 0, ws = null;
+  render();
+  setInterval(function () { if (host) render(); }, 60000);
   var sync = function (s) {
     if (!s || !(s.rev > d.rev)) return;
     d.rev = s.rev;
@@ -533,7 +544,7 @@ const BAR_JS = `(function (d) {
     if (s.latest > d.latest) { fresh = true; if (!d.next) d.next = s.latest; }
     if (d.next > s.latest) d.next = s.latest > d.n ? s.latest : 0;
     d.latest = s.latest; d.count = s.count;
-    render(fresh && d.latest > d.n);
+    render();
   };
   var connect = function () {
     if (dead || ws) return;

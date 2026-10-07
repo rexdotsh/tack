@@ -10,13 +10,16 @@ const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
 const MAX_UPLOAD_BYTES = 30 * 1024 * 1024;
 const MAX_FILES = 200;
 const common = { url: { type: "string" }, json: { type: "boolean" } } as const;
+const FILLER = new Set(
+  "a an the of for and or to in on at by with from into about vs via is are be it its this that our your my how what why".split(" "),
+);
 
 const HELP = `tack - publish HTML docs to your tack instance
 
 Usage:
-  tack upload <file.html|dir> [--slug <slug>] [--new] [--title <t>] [--note <n>] [--json]
+  tack upload <file.html|dir|-> [--slug <slug>] [--new] [--title <t>] [--note <n>] [--json]
   tack get <slug|url> [--v <n>]     print a doc's HTML to stdout
-  tack list [--json]
+  tack list [--match <words>] [--json]  find docs by title or slug
   tack open [slug]                  open a doc in your browser; no slug: unlock the doc list
   tack rm <slug> [--v <n>]          delete a doc, or just one version of it
   tack mv <slug> <new-slug>         rename a doc (old links stop working)
@@ -25,7 +28,7 @@ Usage:
 upload:
   A file is published as the doc's index.html, along with the local images, css
   and pages it references (from its own folder down). A folder must contain
-  index.html; everything in it is published.
+  index.html; everything in it is published. "-" reads one HTML page from stdin.
   --slug <s>   publish to this slug: creates it, or adds a version if it exists
                (pick your own and the link is guessable; new docs get a random one)
   --new        always create a new doc (with --slug: fail if the slug is taken)
@@ -90,17 +93,18 @@ async function upload(argv: string[]) {
     },
   });
   if (positionals.length !== 1) {
-    throw new Error("usage: tack upload <file.html|dir> [--slug s] [--new] [--title t] [--note n] [--json]");
+    throw new Error("usage: tack upload <file.html|dir|-> [--slug s] [--new] [--title t] [--note n] [--json]");
   }
   const cfg = await loadConfig(o.url);
-  const abs = path.resolve(positionals[0]);
-  const files = await collect(abs);
+  const stdin = positionals[0] === "-";
+  const abs = stdin ? "" : path.resolve(positionals[0]);
+  const files = stdin ? await readStdin() : await collect(abs);
   const title = o.title ?? extractTitle(new TextDecoder().decode(files["index.html"]));
 
   const mapFile = path.join(CONFIG_DIR, "paths", sha256(`${cfg.url}\n${abs}`).slice(0, 32));
   let slug = o.slug?.toLowerCase();
   let remembered = false;
-  if (!slug && !o.new) {
+  if (!slug && !o.new && !stdin) {
     slug = (await readText(mapFile))?.split("\n")[0].trim() || undefined;
     remembered = Boolean(slug);
   }
@@ -122,7 +126,7 @@ async function upload(argv: string[]) {
 
   let receipt: Receipt;
   for (let attempt = 0; ; attempt++) {
-    if (auto) slug = makeSlug(title || path.basename(abs).replace(/\.html?$/i, ""));
+    if (auto) slug = makeSlug(title || (stdin ? "doc" : path.basename(abs).replace(/\.html?$/i, "")));
     try {
       receipt = await commit().catch(async (err) => {
         if (!(err instanceof HttpError) || err.status !== 428) throw err;
@@ -136,17 +140,19 @@ async function upload(argv: string[]) {
     }
   }
 
-  await mkdir(path.dirname(mapFile), { recursive: true });
-  await Bun.write(mapFile, `${receipt.slug}\n${cfg.url}\n`);
+  if (!stdin) {
+    await mkdir(path.dirname(mapFile), { recursive: true });
+    await Bun.write(mapFile, `${receipt.slug}\n${cfg.url}\n`);
+  }
 
-  const updateCommand = `tack upload ${shellQuote(abs)} --slug ${receipt.slug}`;
+  const updateCommand = `tack upload ${stdin ? "-" : shellQuote(abs)} --slug ${receipt.slug}`;
   const extras = Object.keys(files).filter((p) => p !== "index.html");
-  if (o.json) return printJson({ ...receipt, path: abs, files: Object.keys(files), updateCommand });
+  if (o.json) return printJson({ ...receipt, path: stdin ? null : abs, files: Object.keys(files), updateCommand });
   const status = receipt.unchanged ? "unchanged" : receipt.version === 1 ? "new doc" : "new version";
   const copied = process.stdout.isTTY && (await copy(receipt.url));
   console.log(`${receipt.url}${copied ? "  (copied)" : ""}`);
   console.log(`  v${receipt.version} (${status}) · pinned: ${receipt.versionUrl}`);
-  if (extras.length && (await stat(abs)).isFile()) {
+  if (extras.length && !stdin && (await stat(abs)).isFile()) {
     const shown = extras.slice(0, 5).join(", ");
     console.log(`  + ${shown}${extras.length > 5 ? `, and ${extras.length - 5} more` : ""}`);
   }
@@ -210,11 +216,14 @@ async function get(argv: string[]) {
 }
 
 async function list(argv: string[]) {
-  const { values: o } = parseArgs({ args: argv, options: common });
+  const { values: o } = parseArgs({ args: argv, options: { ...common, match: { type: "string" } } });
   const cfg = await loadConfig(o.url);
-  const { docs } = await api<{ docs: DocSummary[] }>(cfg, "/api/docs");
+  const terms = (o.match ?? "").toLowerCase().split(/\s+/).filter(Boolean);
+  const docs = (await api<{ docs: DocSummary[] }>(cfg, "/api/docs")).docs.filter((d) =>
+    terms.every((t) => `${d.title} ${d.slug}`.toLowerCase().includes(t)),
+  );
   if (o.json) return printJson(docs);
-  if (!docs.length) return console.log("no docs yet");
+  if (!docs.length) return console.log(terms.length ? "no matching docs" : "no docs yet");
   const width = Math.max(...docs.map((d) => d.slug.length));
   for (const d of docs) {
     const when = d.updatedAt.slice(0, 16).replace("T", " ");
@@ -402,6 +411,14 @@ async function collect(abs: string): Promise<Record<string, Uint8Array>> {
   return files;
 }
 
+async function readStdin(): Promise<Record<string, Uint8Array>> {
+  if (process.stdin.isTTY) throw new Error("pipe the HTML in, e.g. `cat page.html | tack upload -`");
+  const html = new Uint8Array(await Bun.stdin.arrayBuffer());
+  if (!html.byteLength) throw new Error("nothing on stdin");
+  if (html.byteLength > MAX_UPLOAD_BYTES) throw new Error("stdin is over the 30 MB limit");
+  return { "index.html": html };
+}
+
 async function collectFile(abs: string, files: Record<string, Uint8Array>) {
   const root = await realpath(path.dirname(abs));
   const main = path.basename(abs);
@@ -473,15 +490,17 @@ function decodeEntities(s: string): string {
 }
 
 function makeSlug(base: string): string {
-  const stem =
-    base
-      .normalize("NFKD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+/, "")
-      .slice(0, 40)
-      .replace(/-+$/, "") || "doc";
+  const words = base
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+  const meaningful = words.filter((w) => !FILLER.has(w));
+  const stem = (meaningful.length ? meaningful : words)
+    .slice(0, 3)
+    .map((w) => w.slice(0, 16))
+    .join("-") || "doc";
   const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
   const suffix = Array.from(crypto.getRandomValues(new Uint8Array(10)), (b) => alphabet[b % alphabet.length]).join("");
   return `${stem}-${suffix}`;
