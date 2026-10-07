@@ -169,7 +169,15 @@ async function sendBlobs(
     for (let hash; (hash = queue.shift()); ) {
       const bytes = byHash.get(hash);
       if (!bytes) throw new Error(`server asked for an unknown file ${hash}`);
-      await api(cfg, `/api/docs/${encodeURIComponent(slug)}/blobs/${hash}`, { method: "PUT", body: bytes });
+      for (let attempt = 1; ; attempt++) {
+        try {
+          await api(cfg, `/api/docs/${encodeURIComponent(slug)}/blobs/${hash}`, { method: "PUT", body: bytes });
+          break;
+        } catch (err) {
+          if (attempt >= 4 || !(err instanceof HttpError) || err.status !== 503) throw err;
+          await Bun.sleep(1000 * attempt);
+        }
+      }
     }
   };
   await Promise.all(Array.from({ length: 4 }, worker));
