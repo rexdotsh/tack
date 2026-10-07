@@ -270,8 +270,9 @@ async function serveDoc(req: Request, env: Env, url: URL): Promise<Response> {
 
   const type = contentType(path);
   const inject =
+    meta.versions.length > 1 &&
     type.startsWith("text/html") && !url.searchParams.has("raw") && req.headers.get("sec-fetch-dest") === "document";
-  const etag = `"${hash.slice(0, 32)}${inject ? `-bar${version.n}of${latestN}` : ""}"`;
+  const etag = `"${hash.slice(0, 32)}${inject ? `-${BAR_REV}-${version.n}of${latestN}` : ""}"`;
   const headers = new Headers({
     "content-type": type,
     "cache-control": "private, no-cache, no-transform",
@@ -286,35 +287,61 @@ async function serveDoc(req: Request, env: Env, url: URL): Promise<Response> {
   const obj = await env.BUCKET.get(blobKey(slug, hash));
   if (!obj) return notFound(`Missing blob for ${slug} v${version.n} “${path}”.`, slug);
   const res = new Response(obj.body, { headers });
-  return inject ? withVersionBar(res, { slug, n: version.n, latest: latestN, sub }) : res;
+  return inject ? withVersionBar(res, { slug, n: version.n, latest: latestN, sub, at: version.at, note: version.note ?? "" }) : res;
 }
 
 const BAR_JS = `(function (d) {
   var e = function (s) { return String(s).replace(/[&"'<>]/g, function (c) { return "&#" + c.charCodeAt(0) + ";"; }); };
   var base = "/" + d.slug + "/";
   var href = function (n) { return n === d.latest ? base + d.sub : base + "v/" + n + "/" + d.sub; };
+  var icon = function (p) { return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="' + p + '"/></svg>'; };
+  var step = function (n, label, path) {
+    var ok = n >= 1 && n <= d.latest;
+    return '<a class="ic" aria-label="' + label + '" title="' + label + '"' +
+      (ok ? ' href="' + e(href(n)) + '"' : ' aria-disabled="true"') + ">" + icon(path) + "</a>";
+  };
+  var old = d.n < d.latest;
+  var when = new Date(d.at).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
   var host = document.createElement("tack-bar");
   var root = host.attachShadow({ mode: "closed" });
   root.innerHTML =
     "<style>" +
-    ":host{all:initial;position:fixed;right:12px;bottom:12px;z-index:2147483647}" +
-    ".b{display:flex;align-items:center;gap:1px;padding:3px;border-radius:999px;font:500 12px/1 ui-sans-serif,system-ui,sans-serif;" +
-    "color:#e4e4e7;background:rgba(24,24,27,.88);border:1px solid rgba(255,255,255,.14);box-shadow:0 4px 16px rgba(0,0,0,.25);" +
-    "backdrop-filter:blur(6px);opacity:.55;transition:opacity .15s}" +
-    ".b:hover{opacity:1}" +
-    "a,button{all:unset;cursor:pointer;padding:5px 8px;border-radius:999px;color:inherit}" +
-    "a:hover,button:hover{background:rgba(255,255,255,.14)}" +
-    ".off{opacity:.3;pointer-events:none}.old{color:#fbbf24}" +
-    "</style><div class=b>" +
-    "<a class='" + (d.n > 1 ? "" : "off") + "' href='" + e(href(d.n - 1)) + "' title='Previous version'>&lsaquo;</a>" +
-    "<a class='" + (d.n < d.latest ? "old" : "") + "' href='" + e(base + "_history") + "' title='Version history'>v" + d.n + " of " + d.latest + "</a>" +
-    "<a class='" + (d.n < d.latest ? "" : "off") + "' href='" + e(href(d.n + 1)) + "' title='Next version'>&rsaquo;</a>" +
-    "<button title='Hide'>&times;</button></div>";
+    ":host{all:initial;position:fixed;right:16px;bottom:16px;z-index:2147483647;animation:in .3s cubic-bezier(.2,.8,.2,1) .1s both}" +
+    "@keyframes in{from{opacity:0;transform:translateY(8px) scale(.97)}}" +
+    "@media (prefers-reduced-motion:reduce){:host{animation:none}}@media print{:host{display:none}}" +
+    ".bar{display:flex;align-items:center;gap:2px;height:36px;padding:0 5px;box-sizing:border-box;border-radius:999px;" +
+    "font:500 12.5px/1 ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-serif;font-variant-numeric:tabular-nums;color:#fafafa;" +
+    "background:rgba(18,18,20,.8);-webkit-backdrop-filter:blur(16px) saturate(1.6);backdrop-filter:blur(16px) saturate(1.6);" +
+    "border:1px solid rgba(255,255,255,.13);box-shadow:inset 0 1px 0 rgba(255,255,255,.07),0 12px 32px -10px rgba(0,0,0,.5),0 2px 8px rgba(0,0,0,.16)}" +
+    "a,button{all:unset;box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;gap:6px;height:26px;" +
+    "border-radius:999px;cursor:pointer;color:inherit;transition:background .15s,color .15s}" +
+    "a:focus-visible,button:focus-visible{outline:2px solid #60a5fa;outline-offset:1px}" +
+    "svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}" +
+    ".ic{width:26px;color:#a1a1aa}.ic:hover{background:rgba(255,255,255,.1);color:#fff}" +
+    ".ic[aria-disabled]{opacity:.25;cursor:default;background:none;color:#a1a1aa}" +
+    ".label{padding:0 9px}.label:hover{background:rgba(255,255,255,.1)}.label span{color:#a1a1aa;font-weight:400}" +
+    ".dot{width:7px;height:7px;border-radius:50%;background:#34d399;box-shadow:0 0 0 3px rgba(52,211,153,.18)}" +
+    ".old .dot{background:#fbbf24;box-shadow:0 0 0 3px rgba(251,191,36,.2)}" +
+    ".latest{padding:0 9px 0 11px;margin:0 2px;font-weight:600;color:#fcd34d;background:rgba(251,191,36,.15)}" +
+    ".latest:hover{background:rgba(251,191,36,.25)}.latest svg{width:13px;height:13px}" +
+    ".sep{width:1px;height:16px;margin:0 2px;background:rgba(255,255,255,.13)}" +
+    ".x{color:#71717a}" +
+    "</style>" +
+    '<nav class="bar' + (old ? " old" : "") + '" aria-label="Versions">' +
+    step(d.n - 1, "Previous version", "m15 18-6-6 6-6") +
+    '<a class="label" href="' + e(base + "_history") + '" title="' + e("v" + d.n + " · " + when + (d.note ? " · " + d.note : "")) + '">' +
+    '<i class="dot"></i><b>v' + d.n + "</b><span>of " + d.latest + "</span></a>" +
+    step(d.n + 1, "Next version", "m9 18 6-6-6-6") +
+    (old ? '<a class="latest" href="' + e(base + d.sub) + '">Latest' + icon("M5 12h14M13 6l6 6-6 6") + "</a>" : "") +
+    '<i class="sep"></i><button class="ic x" aria-label="Hide" title="Hide">' + icon("M18 6 6 18M6 6l12 12") + "</button></nav>";
   root.querySelector("button").onclick = function () { host.remove(); };
   document.documentElement.appendChild(host);
 })(__DATA__);`;
+const BAR_REV = [...BAR_JS].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 0).toString(36);
 
-function withVersionBar(res: Response, data: { slug: string; n: number; latest: number; sub: string }): Response {
+type BarData = { slug: string; n: number; latest: number; sub: string; at: string; note: string };
+
+function withVersionBar(res: Response, data: BarData): Response {
   const payload = JSON.stringify(data).replace(/</g, "\\u003c");
   const tag = `<script data-tack>${BAR_JS.replace("__DATA__", () => payload)}</script>`;
   let done = false;
