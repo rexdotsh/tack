@@ -8,6 +8,7 @@ type DocSummary = { slug: string; title: string; updatedAt: string; latest: numb
 type UploadBody = { files?: Record<string, unknown>; title?: string; note?: string; create?: boolean };
 
 const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
+const MAX_FILES = 200;
 const RESERVED_SLUGS = new Set(["api"]);
 const metaKey = (slug: string) => `meta/${slug}.json`;
 const blobKey = (slug: string, hash: string) => `blobs/${slug}/${hash}`;
@@ -56,17 +57,19 @@ async function upload(req: Request, env: Env, origin: string, slug: string): Pro
   }
   const body = await req.json<UploadBody>().catch(() => null);
   if (!body?.files || typeof body.files !== "object") return fail(400, "expected JSON { files: { path: base64 } }");
+  const entries = Object.entries(body.files);
+  if (entries.length > MAX_FILES) return fail(413, `an upload can have at most ${MAX_FILES} files`);
 
-  const files: Record<string, string> = {};
+  const files: Record<string, string> = Object.create(null);
   const blobs = new Map<string, Uint8Array>();
   let size = 0;
-  for (const [raw, b64] of Object.entries(body.files)) {
+  for (const [raw, b64] of entries) {
     const path = cleanPath(raw);
     if (!path) return fail(400, `bad file path "${raw}" (no '..', and the first segment can't be 'v' or '_history')`);
     if (typeof b64 !== "string") return fail(400, `file "${raw}" must be a base64 string`);
     let bytes: Uint8Array;
     try {
-      bytes = fromBase64(b64);
+      bytes = Uint8Array.fromBase64(b64);
     } catch {
       return fail(400, `file "${raw}" is not valid base64`);
     }
@@ -75,7 +78,7 @@ async function upload(req: Request, env: Env, origin: string, slug: string): Pro
     blobs.set(hash, bytes);
     size += bytes.byteLength;
   }
-  if (!files["index.html"]) return fail(400, "an upload needs an index.html");
+  if (!Object.hasOwn(files, "index.html")) return fail(400, "an upload needs an index.html");
 
   await Promise.all(
     [...blobs].map(async ([hash, bytes]) => {
@@ -87,8 +90,8 @@ async function upload(req: Request, env: Env, origin: string, slug: string): Pro
   const versionHash = await sha256(
     new TextEncoder().encode(Object.keys(files).sort().map((p) => `${p}\0${files[p]}`).join("\n")),
   );
-  const title = body.title?.trim().slice(0, 300);
-  const note = body.note?.trim().slice(0, 1000);
+  const title = body.title?.trim().slice(0, 300).toWellFormed();
+  const note = body.note?.trim().slice(0, 1000).toWellFormed();
 
   for (let attempt = 0; attempt < 5; attempt++) {
     const now = new Date().toISOString();
@@ -107,20 +110,26 @@ async function upload(req: Request, env: Env, origin: string, slug: string): Pro
     meta.title = title || meta.title;
     meta.updatedAt = now;
 
-    const saved = await env.BUCKET.put(metaKey(slug), JSON.stringify(meta), {
-      onlyIf: existing ? { etagMatches: existing.etag } : new Headers({ "if-none-match": "*" }),
-      httpMetadata: { contentType: "application/json" },
-      customMetadata: {
-        title: encodeURIComponent(meta.title.slice(0, 120)),
-        updatedAt: now,
-        latest: String(version.n),
-        versions: String(meta.versions.length),
-      },
-    });
+    let saved: R2Object | null;
+    try {
+      saved = await env.BUCKET.put(metaKey(slug), JSON.stringify(meta), {
+        onlyIf: existing ? { etagMatches: existing.etag } : new Headers({ "if-none-match": "*" }),
+        httpMetadata: { contentType: "application/json" },
+        customMetadata: {
+          title: encodeURIComponent(meta.title.slice(0, 120).toWellFormed()),
+          updatedAt: now,
+          latest: String(version.n),
+          versions: String(meta.versions.length),
+        },
+      });
+    } catch {
+      await new Promise((r) => setTimeout(r, 1000));
+      continue;
+    }
     if (saved) return json(receipt(origin, meta, version, false), existing ? 200 : 201);
     if (body.create) return fail(409, `slug "${slug}" is already taken`);
   }
-  return fail(409, "too many concurrent uploads to this slug; retry");
+  return fail(503, "too many concurrent uploads to this slug; retry");
 }
 
 function receipt(origin: string, meta: Meta, v: Version, unchanged: boolean) {
@@ -193,14 +202,12 @@ async function serveDoc(req: Request, env: Env, url: URL): Promise<Response> {
 
   const latestN = meta.versions.at(-1)!.n;
   let version = meta.versions.at(-1)!;
-  let pinned = false;
   const vm = sub.match(/^v\/(\d+)(\/.*)?$/);
   if (vm) {
     const found = meta.versions.find((v) => v.n === Number(vm[1]));
     if (!found) return notFound(`${slug} has no version ${vm[1]}.`, slug);
     if (vm[2] === undefined) return redirect(`/${slug}/v/${found.n}/${url.search}`);
     version = found;
-    pinned = true;
     sub = vm[2].slice(1);
   }
 
@@ -210,14 +217,14 @@ async function serveDoc(req: Request, env: Env, url: URL): Promise<Response> {
   } catch {
     return notFound();
   }
-  const files = version.files;
+  const has = (p: string) => Object.hasOwn(version.files, p);
   if (path === "" || path.endsWith("/")) path += "index.html";
-  else if (!files[path]) {
-    if (files[`${path}.html`]) path += ".html";
-    else if (files[`${path}/index.html`]) return redirect(`${url.pathname}/${url.search}`);
+  else if (!has(path)) {
+    if (has(`${path}.html`)) path += ".html";
+    else if (has(`${path}/index.html`)) return redirect(`${url.pathname}/${url.search}`);
   }
-  const hash = files[path];
-  if (!hash) return notFound(`${slug} v${version.n} has no file “${path}”.`, slug);
+  if (!has(path)) return notFound(`${slug} v${version.n} has no file “${path}”.`, slug);
+  const hash = version.files[path];
 
   const type = contentType(path);
   const inject =
@@ -225,7 +232,7 @@ async function serveDoc(req: Request, env: Env, url: URL): Promise<Response> {
   const etag = `"${hash.slice(0, 32)}${inject ? `-bar${version.n}of${latestN}` : ""}"`;
   const headers = new Headers({
     "content-type": type,
-    "cache-control": pinned && !inject ? "private, max-age=31536000, immutable" : "private, no-cache",
+    "cache-control": "private, no-cache",
     etag,
     vary: "sec-fetch-dest",
     "x-tack-slug": slug,
@@ -241,7 +248,7 @@ async function serveDoc(req: Request, env: Env, url: URL): Promise<Response> {
 }
 
 const BAR_JS = `(function (d) {
-  var e = function (s) { return String(s).replace(/[&"<>]/g, function (c) { return "&#" + c.charCodeAt(0) + ";"; }); };
+  var e = function (s) { return String(s).replace(/[&"'<>]/g, function (c) { return "&#" + c.charCodeAt(0) + ";"; }); };
   var base = "/" + d.slug + "/";
   var href = function (n) { return n === d.latest ? base + d.sub : base + "v/" + n + "/" + d.sub; };
   var host = document.createElement("tack-bar");
@@ -397,20 +404,14 @@ const TYPES: Record<string, string> = {
 function contentType(path: string): string {
   const name = path.slice(path.lastIndexOf("/") + 1);
   const dot = name.lastIndexOf(".");
-  return (dot >= 0 && TYPES[name.slice(dot + 1).toLowerCase()]) || "application/octet-stream";
+  const ext = dot >= 0 ? name.slice(dot + 1).toLowerCase() : "";
+  return Object.hasOwn(TYPES, ext) ? TYPES[ext] : "application/octet-stream";
 }
 
 function cleanPath(raw: string): string | null {
   const segs = raw.replace(/\\/g, "/").split("/").filter((s) => s && s !== ".");
   if (!segs.length || segs.includes("..") || segs[0] === "v" || segs[0] === "_history") return null;
   return segs.join("/");
-}
-
-function fromBase64(b64: string): Uint8Array {
-  const bin = atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
 }
 
 async function sha256(data: Uint8Array): Promise<string> {
