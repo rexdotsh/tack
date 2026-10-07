@@ -30,10 +30,10 @@ The `url` stays the same and always shows the latest version. `versionUrl` pins 
 
 Links open without a login, so any fetch tool works. `tack get <url-or-slug>` prints the exact HTML (`--v <n>` for a specific version) and `# <slug> v<n> of <latest>` to stderr.
 
-To see what changed between versions, fetch `https://tack.rex.wf/<slug>/_diff?a=<n>&b=<m>`.
+To see what changed between versions, fetch the doc's `url` with `/_diff?a=<n>&b=<m>` appended.
 
 ## Other commands
 
 `tack list [--match <words>] [--json]`, `tack rm <slug> [--v <n>]`, `tack mv <slug> <new-slug>`, `tack help`. Don't run `tack open`; it's for the user.
 
-Never put the tack token, the config file, or the `tack open` link in a doc or a chat reply. If tack reports a bad or missing token, ask the user to run `tack setup`. If `tack` isn't installed, ask the user to install it (`curl -fsSL https://tack.rex.wf/install | sh`) rather than writing your own uploader.
+Never put the tack token, the config file, or the `tack open` link in a doc or a chat reply. If tack reports a bad or missing token, ask the user to run `tack setup --token <token>` (the token is in `~/.config/tack/config.json` on a machine where tack already works). If `tack` isn't installed, ask the user to install it (`curl -fsSL https://tack.rex.wf/install | sh`) rather than writing your own uploader.

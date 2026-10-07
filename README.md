@@ -12,11 +12,12 @@ An agent runs `tack upload plan.html` and replies with a link. Uploading again a
 ## Setup
 
 1. Create an R2 bucket named `tack`.
-2. Workers & Pages → Import this repo. Deploy command `bunx wrangler deploy`, build variable `BUN_VERSION=1.4.0`. Set your domain in `wrangler.jsonc` and `DEFAULT_URL` in `cli/tack.ts`.
+2. Workers & Pages → Import this repo. Deploy command `bunx wrangler deploy`, build variable `BUN_VERSION=1.4.0`. If you fork it, put your domain in `wrangler.jsonc`, `DEFAULT_URL` in `cli/tack.ts` and `base` in `cli/install.sh`.
 3. Install the CLI and skill (running from the repo needs Node 22.18+):
 
 ```sh
 bun install
+mkdir -p ~/.local/bin ~/.agents/skills
 ln -s "$PWD/cli/tack.ts" ~/.local/bin/tack
 ln -s "$PWD/skill/tack" ~/.agents/skills/tack
 tack setup   # creates a token and sets it on the Worker
