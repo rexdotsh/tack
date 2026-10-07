@@ -63,4 +63,4 @@ Keep every hot path O(1) in requests and R2 operations, and never poll.
 - Page view: 1 Worker request, 1 R2 read (meta). File bytes come from the edge cache (`caches.default`, keyed by content hash) after the first view per colo.
 - Open tab: 2 requests to connect the WebSocket (Worker + Durable Object), then nothing while idle; outgoing messages are free.
 - Identical re-upload: 1 request, 1 R2 read. Changed upload: 2 commits + 1 PUT per new file; existing files are never resent.
-- Diff page: only for text types; computed once per pair of file hashes and cached (never cached on read errors); input is capped (first 150 KB via a ranged read, 2,000 lines, Myers bails past 200 edits, word diffs share a 4,000-token budget).
+- Diff page: only for text types; computed once per pair of file hashes and cached under `DIFF_REV` (bump it whenever the diff output changes, or old results stick forever; never cached on read errors); input is capped (first 150 KB via a ranged read, 2,000 lines, Myers bails past 200 edits, word diffs share a 4,000-token budget).
