@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, lstat, mkdir, open as openFile, readdir, readFile, realpath, rename, rm as removeFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -13,7 +13,7 @@ const CONFIG_DIR = path.join(process.env.XDG_CONFIG_HOME || path.join(homedir(),
 const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
 const MAX_UPLOAD_BYTES = 30 * 1024 * 1024;
 const MAX_FILES = 200;
-const LOCAL_HOSTS = ["localhost", "127.0.0.1", "[::1]"];
+const isLocal = (host: string) => ["localhost", "127.0.0.1", "[::1]"].includes(host) || host.endsWith(".localhost");
 const common = { url: { type: "string" }, json: { type: "boolean" } } as const;
 
 const HELP = `tack - publish HTML docs to your tack instance
@@ -26,7 +26,7 @@ Usage:
   tack rm <slug> [--v <n>]          delete a doc, or just one version of it
   tack mv <slug> <new-slug>         rename a doc (old links stop working)
   tack update                       update this CLI (and the skill) from your instance
-  tack setup [--token <t>|--rotate] save + set the token on the Worker (--token: just save; --rotate: new token)
+  tack setup [--token|--rotate]     save + set the token on the Worker (--token: paste or pipe in an existing token; --rotate: new token)
 
 upload:
   A file is published as the doc's index.html, along with the local images, css
@@ -44,7 +44,7 @@ Every command accepts --url <url>. Precedence: --url, $TACK_URL, config file, ${
 Config: ${CONFIG_FILE}  (env overrides: TACK_URL, TACK_TOKEN)
 `;
 
-type Config = { url: string; token: string };
+type Config = { url: string; token: string; hint?: string };
 type Receipt = {
   ok: true;
   slug: string;
@@ -289,8 +289,13 @@ async function open(argv: string[]) {
   const ref = positionals[0];
   let target: string;
   if (ref) target = new URL(/^https?:\/\//i.test(ref) ? ref : `${cfg.url}/${ref.replace(/^\/+|\/+$/g, "")}/`).href;
-  else if (cfg.token) target = `${cfg.url}/login?key=${sha256(`${cfg.token}:view`)}`;
-  else throw new Error("no token yet (run `tack setup`)");
+  else {
+    if (!cfg.token) throw new Error("no token yet (run `tack setup`)");
+    const { listUrl } = await api<{ listUrl: string | null }>(cfg, "/api/info");
+    if (!listUrl) throw new Error("this instance has no doc list (set LIST_HOST in wrangler.jsonc)");
+    const exp = Math.floor(Date.now() / 1000) + 600;
+    target = `${instanceUrl(listUrl)}/login#${exp}.${createHmac("sha256", cfg.token).update(`unlock:${exp}`).digest("hex")}`;
+  }
   if (!/^https?:$/.test(new URL(target).protocol)) throw new Error("can only open http(s) links");
   console.log(target);
   const gui = process.platform === "darwin" || process.env.DISPLAY || process.env.WAYLAND_DISPLAY;
@@ -361,21 +366,32 @@ async function gitRoot(file: string): Promise<string | null> {
 }
 
 async function setup(argv: string[]) {
-  const { values: o } = parseArgs({
+  const { values: o, positionals } = parseArgs({
     args: argv,
-    options: { ...common, token: { type: "string" }, rotate: { type: "boolean" } },
+    allowPositionals: true,
+    options: { ...common, token: { type: "boolean" }, rotate: { type: "boolean" } },
   });
+  if (positionals.length) {
+    throw new Error("don't put the token on the command line (it shows up in ps and shell history); run `tack setup --token` and paste it when asked, or pipe it in");
+  }
   const current = ((await readJson(CONFIG_FILE)) ?? {}) as Partial<Config>;
   const url = instanceUrl(o.url || process.env.TACK_URL || current.url || DEFAULT_URL);
-  const token =
-    o.token || (!o.rotate && current.token) || randomBytes(32).toString("base64url");
+  const sameInstance = new URL(url).origin === new URL(instanceUrl(current.url || DEFAULT_URL)).origin;
+  const token = o.token
+    ? await readToken()
+    : (!o.rotate && sameInstance && current.token) || randomBytes(32).toString("base64url");
 
   if (o.token) {
     await connect({ url, token }, 1);
   } else {
     const repo = path.join(path.dirname(await realpath(process.argv[1])), "..");
-    if (!(await stat(path.join(repo, "wrangler.jsonc")).catch(() => null))) {
-      throw new Error("creating or rotating the token runs wrangler from a tack checkout; on this machine use `tack setup --token <token>`");
+    const config = await readText(path.join(repo, "wrangler.jsonc"));
+    if (config === null) {
+      throw new Error("creating or rotating the token runs wrangler from a tack checkout; on this machine use `tack setup --token`");
+    }
+    const hosts = [...config.matchAll(/"pattern"\s*:\s*"([^"/]+)/g)].map((m) => m[1]);
+    if (!hosts.includes(new URL(url).hostname)) {
+      throw new Error(`this sets the token on the Worker in ${repo} (${hosts.join(", ")}), not ${url}; use \`tack setup --token\` for other instances`);
     }
     console.log("setting TACK_TOKEN on the Worker with wrangler...");
     if ((await run(["bunx", "wrangler", "secret", "put", "TACK_TOKEN"], { input: token, cwd: repo, inherit: true })) !== 0) {
@@ -390,6 +406,37 @@ async function setup(argv: string[]) {
   await chmod(CONFIG_FILE, 0o600);
   console.log(`saved ${CONFIG_FILE}`);
   if (!o.token) await connect({ url, token }, 6);
+}
+
+async function readToken(): Promise<string> {
+  let token = "";
+  if (!process.stdin.isTTY) {
+    for await (const chunk of process.stdin) token += chunk;
+  } else {
+    process.stderr.write("token: ");
+    process.stdin.setRawMode(true);
+    process.stdin.setEncoding("utf8");
+    try {
+      for await (const chunk of process.stdin) {
+        let done = false;
+        for (const ch of chunk as string) {
+          if (ch === "\r" || ch === "\n") done = true;
+          else if (ch === "\u0003") throw new Error("cancelled");
+          else if (ch === "\u007f" || ch === "\b") token = token.slice(0, -1);
+          else token += ch;
+          if (done) break;
+        }
+        if (done) break;
+      }
+    } finally {
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      process.stderr.write("\n");
+    }
+  }
+  token = token.trim();
+  if (!token) throw new Error("no token given");
+  return token;
 }
 
 async function connect(cfg: Config, tries: number) {
@@ -407,15 +454,17 @@ async function connect(cfg: Config, tries: number) {
 
 async function loadConfig(flagUrl?: string): Promise<Config> {
   const file = ((await readJson(CONFIG_FILE)) ?? {}) as Partial<Config>;
-  return {
-    url: instanceUrl(flagUrl || process.env.TACK_URL || file.url || DEFAULT_URL),
-    token: process.env.TACK_TOKEN || file.token || "",
-  };
+  const saved = instanceUrl(file.url || DEFAULT_URL);
+  const url = instanceUrl(flagUrl || process.env.TACK_URL || saved);
+  if (process.env.TACK_TOKEN) return { url, token: process.env.TACK_TOKEN };
+  if (new URL(url).origin === new URL(saved).origin) return { url, token: file.token || "" };
+  const hint = file.token ? ` (the saved token is only sent to ${saved}; set TACK_TOKEN to use ${url})` : "";
+  return { url, token: "", hint };
 }
 
 function instanceUrl(raw: string): string {
   const url = new URL(raw);
-  if (url.protocol !== "https:" && !LOCAL_HOSTS.includes(url.hostname)) {
+  if (url.protocol !== "https:" && !isLocal(url.hostname)) {
     throw new Error(`${raw}: use https (plain http is only allowed for localhost)`);
   }
   return raw.replace(/\/+$/, "");
@@ -436,7 +485,7 @@ async function request(cfg: Config, target: string, init: RequestInit = {}): Pro
     const location = res.headers.get("location");
     if (res.status < 300 || res.status >= 400 || !location) return res;
     url = new URL(location, url);
-    if (url.protocol !== "https:" && !LOCAL_HOSTS.includes(url.hostname)) throw new Error(`refusing to follow a redirect to ${url.origin}`);
+    if (url.protocol !== "https:" && !isLocal(url.hostname)) throw new Error(`refusing to follow a redirect to ${url.origin}`);
   }
   throw new Error("too many redirects");
 }
@@ -445,7 +494,7 @@ async function api<T>(cfg: Config, pathname: string, init?: RequestInit): Promis
   const res = await request(cfg, pathname, init);
   const body = (await res.json().catch(() => null)) as ({ ok?: boolean; error?: string } & T) | null;
   if (!body) throw new HttpError(`unexpected HTTP ${res.status} from ${cfg.url}${pathname}`, res.status);
-  if (!res.ok || !body.ok) throw new HttpError(body.error || `HTTP ${res.status}`, res.status, body);
+  if (!res.ok || !body.ok) throw new HttpError(`${body.error || `HTTP ${res.status}`}${res.status === 401 ? (cfg.hint ?? "") : ""}`, res.status, body);
   return body;
 }
 
@@ -616,7 +665,11 @@ function decodeEntities(s: string): string {
 
 function makeSlug(): string {
   const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
-  return Array.from(randomBytes(10), (b) => alphabet[b % alphabet.length]).join("");
+  let slug = "";
+  while (slug.length < 10) {
+    for (const b of randomBytes(16)) if (b < 252 && slug.length < 10) slug += alphabet[b % 36];
+  }
+  return slug;
 }
 
 function sha256(data: string | Uint8Array): string {
