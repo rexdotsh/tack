@@ -3,3 +3,4 @@ node_modules/
 .dev.vars
 worker-configuration.d.ts
 dist/
+wrangler.dev.json

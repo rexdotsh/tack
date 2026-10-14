@@ -10,7 +10,7 @@ An agent runs `tack upload plan.html` and replies with a link. Uploading again a
 ## Setup
 
 1. Create an R2 bucket named `tack`.
-2. Workers & Pages → Import this repo. Deploy command `bunx wrangler deploy`, build variable `BUN_VERSION=1.4.0`. If you fork it, put your domain in `wrangler.jsonc`, `DEFAULT_URL` in `cli/tack.ts` and `base` in `cli/install.sh`.
+2. Workers & Pages → Import this repo. Deploy command `bunx wrangler deploy`, build variable `BUN_VERSION=1.4.0`. If you fork it, put your domains in `wrangler.jsonc` (`routes` and `vars`: docs on one host, the doc list on another), `DEFAULT_URL` in `cli/tack.ts` and `base` in `cli/install.sh`.
 3. Install the CLI and skill (running from the repo needs Node 22.18+):
 
 ```sh
@@ -19,14 +19,14 @@ mkdir -p ~/.local/bin ~/.agents/skills
 ln -s "$PWD/cli/tack.ts" ~/.local/bin/tack
 ln -s "$PWD/skill/tack" ~/.agents/skills/tack
 tack setup   # creates a token and sets it on the Worker
-tack open    # unlocks the doc list in your browser
+tack open    # unlocks the doc list (list.tack.rex.wf) in your browser
 ```
 
 Any other machine with Node 20+ installs the CLI and skill from your instance:
 
 ```sh
 curl -fsSL https://tack.rex.wf/install | sh
-tack setup --token <token>   # token is in ~/.config/tack/config.json on the first machine
+tack setup --token   # paste the token from ~/.config/tack/config.json on the first machine
 ```
 
 ## CLI
@@ -38,16 +38,16 @@ tack list [--match words] [--json]
 tack open [slug]
 tack rm <slug> [--v n]
 tack mv <slug> <new-slug>
-tack setup [--token t | --rotate]
+tack setup [--token | --rotate]
 tack update
 ```
 
 ## Dev
 
 ```sh
-echo 'TACK_TOKEN=dev' > .dev.vars
+printf 'TACK_TOKEN=dev\nDOCS_HOST=127.0.0.1:8787\nLIST_HOST=list.localhost:8787\n' > .dev.vars
 bun run dev
-TACK_URL=http://localhost:8787 TACK_TOKEN=dev tack upload plan.html
+TACK_URL=http://127.0.0.1:8787 TACK_TOKEN=dev tack upload plan.html
 ```
 
 Internals and invariants are in [AGENTS.md](AGENTS.md).
