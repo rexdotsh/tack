@@ -4,6 +4,8 @@ interface Env {
   BUCKET: R2Bucket;
   LIVE: DurableObjectNamespace<Live>;
   TACK_TOKEN?: string;
+  DOCS_HOST?: string;
+  LIST_HOST?: string;
 }
 
 type Version = { n: number; at: string; hash: string; size: number; files: Record<string, string>; note?: string };
@@ -124,8 +126,17 @@ export default {
 
 async function route(req: Request, env: Env, ctx: ExecutionContext, url: URL): Promise<Response> {
   if (url.pathname === "/robots.txt") return text("User-agent: *\nDisallow: /\n");
-  if (url.pathname === "/login") return login(env, url);
-  if (url.pathname === "/") return (await isViewer(req, env)) ? indexPage(env) : locked();
+  if (env.LIST_HOST && url.host === env.LIST_HOST) return listSite(req, env, url);
+  if (url.pathname === "/") {
+    if (!env.LIST_HOST) return notFound();
+    return new Response(null, {
+      status: 302,
+      headers: {
+        location: `${url.protocol}//${env.LIST_HOST}/`,
+        "set-cookie": "tack=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax",
+      },
+    });
+  }
   if (url.pathname === "/api" || url.pathname.startsWith("/api/")) {
     if (!env.TACK_TOKEN) return fail(503, "the TACK_TOKEN secret is not set on the Worker (run `tack setup`)");
     const token = req.headers.get("authorization")?.match(/^Bearer (.+)$/i)?.[1];
@@ -135,23 +146,55 @@ async function route(req: Request, env: Env, ctx: ExecutionContext, url: URL): P
   return serveDoc(req, env, ctx, url);
 }
 
+async function listSite(req: Request, env: Env, url: URL): Promise<Response> {
+  let res: Response;
+  if (url.pathname === "/") res = (await isViewer(req, env)) ? await indexPage(env, `${url.protocol}//${env.DOCS_HOST}`) : locked();
+  else if (url.pathname === "/login") res = req.method === "POST" ? await login(req, env) : loginPage();
+  else res = notFound();
+  res = new Response(res.body, res);
+  res.headers.set("x-frame-options", "DENY");
+  res.headers.set("content-security-policy", "frame-ancestors 'none'");
+  res.headers.set("cross-origin-opener-policy", "same-origin");
+  res.headers.set("cross-origin-resource-policy", "same-origin");
+  return res;
+}
+
 async function viewKey(env: Env): Promise<string | null> {
   return env.TACK_TOKEN ? sha256(new TextEncoder().encode(`${env.TACK_TOKEN}:view`)) : null;
 }
 
 async function isViewer(req: Request, env: Env): Promise<boolean> {
   const key = await viewKey(env);
-  const cookie = req.headers.get("cookie")?.match(/(?:^|;\s*)tack=([^;]*)/)?.[1];
-  return key !== null && (await same(cookie, key));
+  if (!key) return false;
+  for (const [, value] of (req.headers.get("cookie") ?? "").matchAll(/(?:^|;\s*)__Host-tack=([^;]*)/g)) {
+    if (await same(value, key)) return true;
+  }
+  return false;
 }
 
-async function login(env: Env, url: URL): Promise<Response> {
+async function login(req: Request, env: Env): Promise<Response> {
   const key = await viewKey(env);
-  if (!key || !(await same(url.searchParams.get("key"), key))) return locked();
+  const [exp, sig] = (await req.text()).trim().split(".");
+  const now = Math.floor(Date.now() / 1000);
+  const fresh = /^\d{1,12}$/.test(exp ?? "") && Number(exp) >= now && Number(exp) <= now + 3600;
+  if (!key || !fresh || !(await same(sig, await hmac(env.TACK_TOKEN!, `unlock:${exp}`)))) {
+    return text("that unlock link didn't work or has expired", 403);
+  }
   return new Response(null, {
-    status: 302,
-    headers: { location: "/", "set-cookie": `tack=${key}; Max-Age=31536000; Path=/; HttpOnly; Secure; SameSite=Lax` },
+    status: 204,
+    headers: { "set-cookie": `__Host-tack=${key}; Max-Age=31536000; Path=/; HttpOnly; Secure; SameSite=Lax` },
   });
+}
+
+let hmacKey: { secret: string; key: Promise<CryptoKey> } | undefined;
+
+async function hmac(secret: string, message: string): Promise<string> {
+  if (hmacKey?.secret !== secret) {
+    const raw = new TextEncoder().encode(secret);
+    hmacKey = { secret, key: crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]) };
+  }
+  const sig = await crypto.subtle.sign("HMAC", await hmacKey.key, new TextEncoder().encode(message));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 async function same(given: string | null | undefined, expected: string): Promise<boolean> {
@@ -165,6 +208,9 @@ async function same(given: string | null | undefined, expected: string): Promise
 }
 
 async function api(req: Request, env: Env, url: URL): Promise<Response> {
+  if (url.pathname === "/api/info") {
+    return json({ ok: true, listUrl: env.LIST_HOST ? `${url.protocol}//${env.LIST_HOST}` : null });
+  }
   const m = url.pathname.match(/^\/api\/docs(?:\/([^/]+)(?:\/(rename|v\/\d+|blobs\/[0-9a-f]{64}))?)?\/?$/);
   if (!m) return fail(404, "not found");
   const [, slug, sub] = m;
@@ -528,7 +574,7 @@ async function serveDoc(req: Request, env: Env, ctx: ExecutionContext, url: URL)
     note: version.note ?? "",
     rev: meta.rev ?? 0,
     gen: meta.gen ?? 0,
-    seenKey: hash36(`seen:${slug}`),
+    seenKey: env.TACK_TOKEN ? (await hmac(env.TACK_TOKEN, `seen:${slug}`)).slice(0, 24) : "",
   };
   const etag = `"${hash.slice(0, 32)}${inject ? `-${hash36(BAR_JS + JSON.stringify(bar))}` : ""}"`;
   const headers = new Headers({
@@ -579,13 +625,17 @@ const BAR_JS = `(function (d) {
   };
   var when = new Date(d.at).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
   var dead = false, fresh = false, news = false, tries = 0, ws = null, host, root;
-  if (!d.pinned) {
-    try {
+  try {
+    for (var k = localStorage.length - 1; k >= 0; k--) {
+      var key = localStorage.key(k) || "";
+      if (key.indexOf("tack:seen:") === 0 && !/^tack:seen:[0-9a-f]{24}$/.test(key)) localStorage.removeItem(key);
+    }
+    if (!d.pinned && d.seenKey) {
       var seen = Number(localStorage.getItem("tack:seen:" + d.seenKey)) || 0;
       news = seen > 0 && seen < d.latest;
       localStorage.setItem("tack:seen:" + d.seenKey, String(d.latest));
-    } catch (_) {}
-  }
+    }
+  } catch (_) {}
   var render = function () {
     if (d.count < 2) {
       if (host) { host.remove(); host = root = null; }
@@ -745,13 +795,13 @@ function page(title: string, body: string): string {
 
 const time = (iso: string) => `<time datetime="${esc(iso)}">${esc(iso.slice(0, 16).replace("T", " "))}</time>`;
 
-async function indexPage(env: Env): Promise<Response> {
+async function indexPage(env: Env, docsOrigin: string): Promise<Response> {
   const docs = await listDocs(env);
   const rows = docs
     .map(
       (d) =>
-        `<tr><td><a href="/${d.slug}/">${esc(d.title)}</a><div class="m">${d.slug}</div></td>` +
-        `<td><a href="/${d.slug}/_history">v${d.latest}</a></td><td>${time(d.updatedAt)}</td></tr>`,
+        `<tr><td><a href="${esc(docsOrigin)}/${d.slug}">${esc(d.title)}</a><div class="m">${d.slug}</div></td>` +
+        `<td><a href="${esc(docsOrigin)}/${d.slug}/_history">v${d.latest}</a></td><td>${time(d.updatedAt)}</td></tr>`,
     )
     .join("");
   return html(
@@ -1003,6 +1053,19 @@ function decodeEntities(s: string): string {
     }
     return Object.hasOwn(ENTITIES, e) ? ENTITIES[e] : Object.hasOwn(ENTITIES, e.toLowerCase()) ? ENTITIES[e.toLowerCase()] : all;
   });
+}
+
+function loginPage(): Response {
+  const js = `(async () => {
+  const code = location.hash.slice(1);
+  history.replaceState(null, "", "/login");
+  const say = (t) => (document.getElementById("s").textContent = t);
+  if (!code) return say("Run tack open for an unlock link.");
+  const res = await fetch("/login", { method: "POST", body: code });
+  if (res.ok) location.replace("/");
+  else say("That unlock link didn't work or has expired. Run tack open again.");
+})();`;
+  return html(page("tack", `<h1>📌 tack</h1><p class="m" id="s">Unlocking…</p><script>${js}</script>`));
 }
 
 function locked(): Response {

@@ -6,9 +6,13 @@
 
   "workers_dev": false,
   "preview_urls": false,
-  "routes": [{ "pattern": "tack.rex.wf", "custom_domain": true }],
+  "routes": [
+    { "pattern": "tack.rex.wf", "custom_domain": true },
+    { "pattern": "list.tack.rex.wf", "custom_domain": true }
+  ],
+  "vars": { "DOCS_HOST": "tack.rex.wf", "LIST_HOST": "list.tack.rex.wf" },
 
-  "build": { "command": "bun run build:cli && cp skill/tack/SKILL.md dist/skill.md && cp cli/install.sh dist/install" },
+  "build": { "command": "bun run build" },
   "assets": { "directory": "./dist" },
 
   "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "tack" }],
