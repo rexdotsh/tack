@@ -5,7 +5,7 @@ tack: a private postplan.dev. A Cloudflare Worker + R2 bucket serves versioned H
 ## Layout
 
 - `src/worker.ts`: the whole Worker (API, serving, index/history/diff pages, version chip) plus the `Live` Durable Object.
-- `cli/tack.ts`: the whole CLI, zero dependencies. Node built-ins only and erasable TypeScript only, so it runs as-is on Node 22.18+ (type stripping) and Bun, and `bun run build:cli` bundles it to `dist/cli` for Node 20+.
+- `cli/tack.ts`: the whole CLI, zero dependencies. Node built-ins only and erasable TypeScript only, so it runs as-is on Node 22.18+ (type stripping) and Bun, and `bun run build` bundles it to `dist/cli` for Node 20+.
 - `skill/tack/SKILL.md`: skill that tells agents how to use the CLI.
 - `wrangler.jsonc`: Worker config. Deployed from the Cloudflare dashboard via GitHub, so this file is the source of truth on every push. Its build step bundles the CLI and copies the skill and `cli/install.sh` into `dist/`, served as static assets at `/cli`, `/skill.md` and `/install` (free, no Worker invocation), so installs always match the deployed Worker. The installer saves the CLI as `~/.local/share/tack/tack.mjs` (the `.mjs` makes it ESM on every Node 20+, regardless of package.json scope) and links `~/.local/bin/tack` to it. `tack update` re-downloads the CLI and a downloaded skill through unique temp files, and refuses to touch anything inside a git checkout.
 
@@ -14,9 +14,9 @@ tack: a private postplan.dev. A Cloudflare Worker + R2 bucket serves versioned H
 ```sh
 bun install
 bun run check     # wrangler types + tsc for worker and cli
-echo 'TACK_TOKEN=dev' > .dev.vars
-bun run dev       # local worker with local R2 on :8787
-TACK_URL=http://localhost:8787 TACK_TOKEN=dev XDG_CONFIG_HOME=/tmp/tack-cfg ./cli/tack.ts upload x.html
+printf 'TACK_TOKEN=dev\nDOCS_HOST=127.0.0.1:8787\nLIST_HOST=list.localhost:8787\n' > .dev.vars
+bun run dev       # local worker with local R2 on :8787; docs on 127.0.0.1, doc list on list.localhost
+TACK_URL=http://127.0.0.1:8787 TACK_TOKEN=dev XDG_CONFIG_HOME=/tmp/tack-cfg ./cli/tack.ts upload x.html
 ```
 
 There are no automated tests. Verify changes against `bun run dev` with the CLI and curl. Never run `tack setup` without `--token` while testing: it sets the secret on the real Worker.
@@ -28,7 +28,7 @@ New docs get a slug of 10 random base36 characters (~51 bits), which is what kee
 ## Rules
 
 - Bun for repo tooling: `bun`, `bunx`, `bun.lock`. No npm/npx.
-- The CLI must not depend on Bun: no `Bun.*` APIs, no top-level await, no TypeScript-only runtime syntax (`cli/tsconfig.json` enforces `erasableSyntaxOnly`). Check changes with `node cli/tack.ts` and `bun run build:cli && node dist/cli`.
+- The CLI must not depend on Bun: no `Bun.*` APIs, no top-level await, no TypeScript-only runtime syntax (`cli/tsconfig.json` enforces `erasableSyntaxOnly`). Check changes with `node cli/tack.ts` and `bun run build && node dist/cli`.
 - Keep it minimal. No frameworks, no runtime dependencies, no new Cloudflare resources unless unavoidable.
 - No comments unless the code would be misleading without one.
 - Conventional commits with short messages (`feat: ...`, `fix: ...`).
@@ -37,8 +37,12 @@ New docs get a slug of 10 random base36 characters (~51 bits), which is what kee
 
 - Docs (`/<slug>/...`, `/<slug>/_history`) are public to anyone with the link. Privacy comes from the 10-char random slug suffix the CLI generates, plus `x-robots-tag: noindex`, `referrer-policy: no-referrer` and a disallow-all `robots.txt`.
 - `/api/*` requires `Authorization: Bearer <TACK_TOKEN>` (a Worker secret). It fails closed when the secret is unset.
-- `/` (the doc list) requires the `tack` cookie, set by `/login?key=<view key>`. The view key is `sha256(TACK_TOKEN + ":view")`, so it can list docs but never write. `tack open` prints that link.
+- The doc list lives on a separate host (`LIST_HOST`, e.g. `list.tack.rex.wf`) from the docs (`DOCS_HOST`). Docs run arbitrary same-origin JS, so nothing on the docs host may grant access to anything: no cookies, no ambient auth. `/` on the docs host just redirects to the list host. Never move the list, login, or any cookie-authenticated route back onto the docs host.
+- On the list host, `/` requires the host-only `__Host-tack` cookie holding the view key `sha256(TACK_TOKEN + ":view")`; it can list docs but never write. List-host responses send `frame-ancestors 'none'`, `X-Frame-Options: DENY`, COOP and CORP `same-origin`, and never any CORS headers.
+- Unlocking: `tack open` asks `/api/info` for the list URL and prints `<list>/login#<exp>.<hmac(TACK_TOKEN, "unlock:<exp>")>`, valid 10 minutes. The code is in the fragment, so it never reaches the server's URL logs or a Referer; the login page POSTs it, clears it from history, and the Worker sets the cookie.
+- The chip's "last seen" localStorage keys are `HMAC(TACK_TOKEN, "seen:<slug>")`, never derived from the slug alone: every doc's JS can read every key on the docs origin.
 - Compare secrets with `same()` (constant time). Never accept the cookie or view key for writes.
+- The CLI only uses the saved token for the saved instance's origin; `--url`/`TACK_URL` pointing elsewhere needs `TACK_TOKEN`. Tokens are never taken as command-line arguments (`tack setup --token` reads stdin or a hidden prompt).
 
 ## Invariants
 
@@ -55,6 +59,7 @@ New docs get a slug of 10 random base36 characters (~51 bits), which is what kee
 - Live updates are pushed, never polled: one `Live` Durable Object per slug holds hibernatable WebSockets from open tabs (read-only; any client message closes the socket). Every state carries `(gen, rev)`: `meta.gen` is issued by the slug's Durable Object (`begin()`, strictly increasing even across clock skew) when a slug starts a new life (created, or renamed into), and `meta.rev` is bumped on every committed change. States also keep the legacy `latest`/`count` fields for tabs opened before a deploy. The DO stores and broadcasts a state only if its `(gen, rev)` is newer than what it has, and tabs act only on states newer than their page, so delayed or reordered notifications (even from a deleted, recreated doc) can't regress state or loop reloads. States carry the version list (`ns`) so pinned tabs can recompute their neighbours. Tabs reset their reconnect budget only after a connection stays up 30 s, stop after ~1 minute of failures, and retry when they become visible.
 - Workers Free allows 1,000 R2 calls per request, so uploads are capped at 200 files (worker and CLI). Use `Object.hasOwn` for lookups keyed by paths or extensions.
 - The CLI never loads `.env` files (Node doesn't by default; don't add dotenv), so a project's `.env` can't redirect the token. It only sends the token to its configured origin, which must be https (http only for localhost), and never follows a redirect to plain http. Running the CLI with plain `bun` would bring back `.env` autoloading; use `node` or `bun --no-env-file`. Folder uploads never follow symlinks.
+- `bun run build` recreates `dist/` from scratch and fails unless it holds exactly `cli`, `install` and `skill.md`: anything in `dist/` is public and served before the Worker.
 - Every response is `cache-control: ... no-transform`; without it Cloudflare's bot detection injects a script into HTML and docs stop being byte-for-byte.
 - Workers Builds needs the `BUN_VERSION` build variable (≥ 1.4) to read `bun.lock`.
 
