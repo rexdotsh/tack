@@ -8,7 +8,17 @@ interface Env {
   LIST_HOST?: string;
 }
 
-type Version = { n: number; at: string; hash: string; size: number; files: Record<string, string>; note?: string };
+type Version = {
+  n: number;
+  at: string;
+  hash: string;
+  size: number;
+  files?: Record<string, string>;
+  manifest?: string;
+  count?: number;
+  note?: string;
+};
+type Files = Record<string, string>;
 type Meta = {
   slug: string;
   title: string;
@@ -18,6 +28,7 @@ type Meta = {
   rev?: number;
   gen?: number;
   lock?: { reason: string; at: number; to?: string; from?: string; phase?: "cleanup" };
+  renamedFrom?: { slug: string; gen: number };
   versions: Version[];
 };
 type DocSummary = { slug: string; title: string; updatedAt: string; latest: number; versions: number };
@@ -38,6 +49,8 @@ const RESERVED_SLUGS = new Set(["api", "login", "cli", "install"]);
 const RESERVED_PATHS = new Set(["v", "_history", "_diff", "_live"]);
 const HASH_RE = /^[0-9a-f]{64}$/;
 const LOCK_MS = 5 * 60_000;
+const INLINE_FILES = 8;
+const fileCount = (v: Version) => v.count ?? Object.keys(v.files ?? {}).length;
 const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const newer = (a: LiveState, b: LiveState) => (a.gen ?? 0) - (b.gen ?? 0) || a.rev - b.rev;
 const liveState = (meta: Meta): LiveState => {
@@ -243,8 +256,11 @@ async function blocked(env: Env, meta: Meta): Promise<string | null> {
   if (!lock.to) return finish(meta.slug, "delete");
   if (lock.phase === "cleanup") return finish(meta.slug, `rename to ${lock.to}`);
   const target = await getMeta(env, lock.to);
-  if (!target) return null;
-  return finish(target.lock?.from === meta.slug ? lock.to : meta.slug, `rename to ${lock.to}`);
+  if (target?.lock?.from === meta.slug) return finish(lock.to, `rename to ${lock.to}`);
+  if (target?.renamedFrom?.slug === meta.slug && target.renamedFrom.gen === (meta.gen ?? 0)) {
+    return finish(meta.slug, `rename to ${lock.to}`);
+  }
+  return null;
 }
 
 async function putBlob(req: Request, env: Env, slug: string, hash: string): Promise<Response> {
@@ -294,7 +310,7 @@ async function upload(req: Request, env: Env, origin: string, slug: string): Pro
     if (existing && body.create) return fail(409, `slug "${slug}" is already taken`);
     const meta: Meta = existing
       ? await existing.json<Meta>()
-      : { slug, title: slug, createdAt: now, updatedAt: now, gen: await nextGen(env, slug), versions: [] };
+      : { slug, title: slug, createdAt: now, updatedAt: now, versions: [] };
     const current = existing ? `${meta.gen ?? 0}:${meta.createdAt}` : "new";
     if (current !== lifecycle) present.clear();
     lifecycle = current;
@@ -304,13 +320,15 @@ async function upload(req: Request, env: Env, origin: string, slug: string): Pro
     const latest = meta.versions.at(-1);
     if (latest && latest.hash === versionHash) return json(receipt(origin, meta, latest, true));
 
-    const known = new Set(meta.versions.flatMap((v) => Object.values(v.files)));
+    const known = new Set(meta.versions.flatMap((v) => Object.values(v.files ?? {})));
     const fresh = [...new Set(Object.values(files))].filter((h) => !known.has(h) && !present.has(h));
     const heads = await Promise.all(fresh.map((h) => env.BUCKET.head(blobKey(slug, h))));
     fresh.forEach((h, i) => heads[i] && present.add(h));
     const missing = fresh.filter((h) => !present.has(h));
     if (missing.length) return json({ ok: false, error: "upload these files first", missing }, 428);
 
+    if (!existing) meta.gen = await nextGen(env, slug);
+    await compact(env, slug, meta.versions);
     const version: Version = { n: Math.max(meta.lastN ?? 0, latest?.n ?? 0) + 1, at: now, hash: versionHash, size, files };
     if (note) version.note = note;
     meta.versions.push(version);
@@ -328,6 +346,34 @@ async function upload(req: Request, env: Env, origin: string, slug: string): Pro
     if (body.create) return fail(409, `slug "${slug}" is already taken`);
   }
   return fail(503, "too many concurrent uploads to this slug; retry");
+}
+
+async function compact(env: Env, slug: string, versions: Version[]) {
+  const bulky = versions.filter((v) => v.files && Object.keys(v.files).length > INLINE_FILES).slice(0, 50);
+  await Promise.all(
+    bulky.map(async (v) => {
+      const files = v.files!;
+      const body = new TextEncoder().encode(JSON.stringify(Object.fromEntries(Object.keys(files).sort().map((p) => [p, files[p]]))));
+      const hash = await sha256(body);
+      await env.BUCKET.put(blobKey(slug, hash), body, { sha256: hash });
+      v.manifest = hash;
+      v.count = Object.keys(files).length;
+      delete v.files;
+    }),
+  );
+}
+
+async function filesOf(env: Env, ctx: ExecutionContext | null, slug: string, v: Version): Promise<Files | null> {
+  if (v.files) return Object.assign(Object.create(null), v.files);
+  if (!v.manifest) return null;
+  let text: string | null = null;
+  if (ctx) {
+    const body = await readBlob(env, ctx, slug, v.manifest);
+    text = body ? await new Response(body).text() : null;
+  } else {
+    text = (await (await env.BUCKET.get(blobKey(slug, v.manifest)))?.text()) ?? null;
+  }
+  return text === null ? null : Object.assign(Object.create(null), JSON.parse(text));
 }
 
 function receipt(origin: string, meta: Meta, v: Version, unchanged: boolean) {
@@ -403,6 +449,15 @@ async function removeVersion(env: Env, slug: string, n: number): Promise<Respons
     if (meta.versions.length === 1) return fail(400, `v${n} is the only version; use \`tack rm ${slug}\` to delete the doc`);
     const [gone] = meta.versions.splice(i, 1);
     meta.lastN = Math.max(meta.lastN ?? 0, gone.n);
+    const newest = meta.versions.at(-1)!;
+    if (!newest.files) {
+      const files = await filesOf(env, null, slug, newest);
+      if (files) {
+        newest.files = { ...files };
+        delete newest.manifest;
+        delete newest.count;
+      }
+    }
     meta.rev = (meta.rev ?? 0) + 1;
     meta.updatedAt = new Date().toISOString();
     if (await saveMeta(env, meta, { etagMatches: obj.etag })) {
@@ -422,7 +477,12 @@ async function rename(req: Request, env: Env, origin: string, slug: string): Pro
   const meta = await obj.json<Meta>();
   const lock = await blocked(env, meta);
   if (lock) return fail(409, lock);
-  const hashes = [...new Set(meta.versions.flatMap((v) => Object.values(v.files)))];
+  if (meta.versions.filter((v) => !v.files).length > 100) return fail(413, `${slug} has too many versions to rename`);
+  const lists = await Promise.all(meta.versions.map((v) => filesOf(env, null, slug, v)));
+  if (lists.includes(null)) return fail(500, `${slug} is missing stored files; not renamed`);
+  const hashes = [
+    ...new Set([...lists.flatMap((f) => Object.values(f!)), ...meta.versions.flatMap((v) => (v.manifest ? [v.manifest] : []))]),
+  ];
   if (hashes.length > MAX_FILES * 2) return fail(413, `${slug} has too many files to rename`);
 
   const sourceLock = { reason: `being renamed to ${to}`, at: Date.now(), to };
@@ -430,7 +490,13 @@ async function rename(req: Request, env: Env, origin: string, slug: string): Pro
   if (!locked) return fail(409, `${slug} changed while renaming; retry`);
   const unlock = () => saveMeta(env, meta, { etagMatches: locked.etag }).catch(() => null);
 
-  const moved: Meta = { ...meta, slug: to, gen: await nextGen(env, to), rev: (meta.rev ?? 0) + 1 };
+  const moved: Meta = {
+    ...meta,
+    slug: to,
+    gen: await nextGen(env, to),
+    rev: (meta.rev ?? 0) + 1,
+    renamedFrom: { slug, gen: meta.gen ?? 0 },
+  };
   delete moved.lock;
   const reserved = await saveMeta(
     env,
@@ -522,7 +588,7 @@ async function serveDoc(req: Request, env: Env, ctx: ExecutionContext, url: URL)
   const meta = await getMeta(env, slug);
   if (!meta) return notFound(`No doc called “${slug}”.`);
 
-  const single = (v: Version) => Object.keys(v.files).length === 1;
+  const single = (v: Version) => fileCount(v) === 1;
   let sub = rest?.slice(1) ?? "";
   if (sub === "_history") return html(historyPage(meta));
   if (sub === "_diff") return diffPage(env, ctx, meta, url);
@@ -548,20 +614,22 @@ async function serveDoc(req: Request, env: Env, ctx: ExecutionContext, url: URL)
   } catch {
     return notFound();
   }
-  const has = (p: string) => Object.hasOwn(version.files, p);
+  const files = await filesOf(env, ctx, slug, version);
+  if (!files) return notFound(`Missing file list for ${slug} v${version.n}.`, slug);
+  const has = (p: string) => Object.hasOwn(files, p);
   if (path === "" || path.endsWith("/")) path += "index.html";
   else if (!has(path)) {
     if (has(`${path}.html`)) path += ".html";
     else if (has(`${path}/index.html`)) return redirect(`${url.pathname}/${url.search}`);
   }
   if (!has(path)) return notFound(`${slug} v${version.n} has no file “${path}”.`, slug);
-  const hash = version.files[path];
+  const hash = files[path];
 
   const type = contentType(path);
   const inject =
     type.startsWith("text/html") && !url.searchParams.has("raw") && req.headers.get("sec-fetch-dest") === "document";
   const i = meta.versions.indexOf(version);
-  const bar: BarData = {
+  const bar: BarData | null = inject ? {
     slug,
     n: version.n,
     latest: latestN,
@@ -575,8 +643,8 @@ async function serveDoc(req: Request, env: Env, ctx: ExecutionContext, url: URL)
     rev: meta.rev ?? 0,
     gen: meta.gen ?? 0,
     seenKey: env.TACK_TOKEN ? (await hmac(env.TACK_TOKEN, `seen:${slug}`)).slice(0, 24) : "",
-  };
-  const etag = `"${hash.slice(0, 32)}${inject ? `-${hash36(BAR_JS + JSON.stringify(bar))}` : ""}"`;
+  } : null;
+  const etag = `"${hash.slice(0, 32)}${bar ? `-${hash36(BAR_JS + JSON.stringify(bar))}` : ""}"`;
   const headers = new Headers({
     "content-type": type,
     "cache-control": "private, no-cache, no-transform",
@@ -591,7 +659,7 @@ async function serveDoc(req: Request, env: Env, ctx: ExecutionContext, url: URL)
   const body = await readBlob(env, ctx, slug, hash);
   if (!body) return notFound(`Missing blob for ${slug} v${version.n} “${path}”.`, slug);
   const res = new Response(body, { headers });
-  return inject ? withVersionBar(res, bar) : res;
+  return bar ? withVersionBar(res, bar) : res;
 }
 
 async function readBlob(env: Env, ctx: ExecutionContext, slug: string, hash: string): Promise<ReadableStream | null> {
@@ -825,7 +893,7 @@ function historyPage(meta: Meta): string {
         `<tr><td><a href="/${meta.slug}/v/${v.n}/">v${v.n}</a>${v.n === latest ? ` <span class="m">· latest</span>` : ""}` +
         `${all[i + 1] ? ` <span class="m">· <a href="/${meta.slug}/_diff?a=${all[i + 1].n}&b=${v.n}">changes</a></span>` : ""}` +
         `${v.note ? `<div class="note">${esc(v.note)}</div>` : ""}</td>` +
-        `<td>${Object.keys(v.files).length} file${Object.keys(v.files).length === 1 ? "" : "s"} · ${fmtSize(v.size)}</td>` +
+        `<td>${fileCount(v)} file${fileCount(v) === 1 ? "" : "s"} · ${fmtSize(v.size)}</td>` +
         `<td>${time(v.at)}</td></tr>`,
     )
     .join("");
@@ -842,7 +910,9 @@ async function diffPage(env: Env, ctx: ExecutionContext, meta: Meta, url: URL): 
   const b = pick(url.searchParams.get("b")) ?? meta.versions.at(-1)!;
   const a = pick(url.searchParams.get("a")) ?? meta.versions[Math.max(0, meta.versions.indexOf(b) - 1)];
   const path = url.searchParams.get("path") || "index.html";
-  const [ha, hb] = [a, b].map((v) => (Object.hasOwn(v.files, path) ? v.files[path] : ""));
+  const [fa, fb] = await Promise.all([filesOf(env, ctx, meta.slug, a), filesOf(env, ctx, meta.slug, b)]);
+  if (!fa || !fb) return notFound(`Missing file list for ${meta.slug}.`, meta.slug);
+  const [ha, hb] = [fa, fb].map((f) => (Object.hasOwn(f, path) ? f[path] : ""));
   const textual = (p: string) => /^(text\/|application\/(json|xml)|image\/svg)/.test(contentType(p));
   const result: DiffResult =
     ha === hb
@@ -851,13 +921,13 @@ async function diffPage(env: Env, ctx: ExecutionContext, meta: Meta, url: URL): 
         ? await cachedDiff(env, ctx, meta.slug, ha, hb, /\.html?$/i.test(path))
         : { added: 0, removed: 0, html: "", error: `${path} isn't a text file` };
 
-  const files = [...new Set([...Object.keys(a.files), ...Object.keys(b.files)])].sort().flatMap((p) => {
-    const [x, y] = [a, b].map((v) => (Object.hasOwn(v.files, p) ? v.files[p] : ""));
+  const files = [...new Set([...Object.keys(fa), ...Object.keys(fb)])].sort().flatMap((p) => {
+    const [x, y] = [fa, fb].map((f) => (Object.hasOwn(f, p) ? f[p] : ""));
     if (x === y) return [];
     const name = textual(p) && p !== path ? `<a href="?a=${a.n}&b=${b.n}&path=${encodeURIComponent(p)}">${esc(p)}</a>` : esc(p);
     return [`${name} ${!x ? "added" : !y ? "removed" : "changed"}`];
   });
-  const multi = Object.keys(a.files).length > 1 || Object.keys(b.files).length > 1;
+  const multi = fileCount(a) > 1 || fileCount(b) > 1;
   const options = (sel: Version) =>
     meta.versions.map((v) => `<option value="${v.n}"${v === sel ? " selected" : ""}>v${v.n}</option>`).join("");
   const slug = meta.slug;
@@ -872,7 +942,7 @@ async function diffPage(env: Env, ctx: ExecutionContext, meta: Meta, url: URL): 
         `${path === "index.html" ? "" : `<input type="hidden" name="path" value="${esc(path)}">`}<button>Compare</button>` +
         `<span>· <a href="/${slug}/v/${a.n}/${subpath}">open v${a.n}</a> · <a href="/${slug}/v/${b.n}/${subpath}">open v${b.n}</a></span></form>` +
         `<div class="m">${result.error ? esc(result.error) : added || removed ? `+${added} −${removed} lines` : "No text changes"}${path === "index.html" ? "" : ` in ${esc(path)}`}` +
-        `${result.partial ? " (only the first 150 KB / 2,000 lines of each version were compared)" : ""}</div>` +
+        `${result.partial ? ` (only the first ${MAX_DIFF_BYTES / 1000} KB / ${MAX_DIFF_LINES.toLocaleString("en")} lines of each version were compared)` : ""}</div>` +
         (multi && files.length ? `<div class="m">Files: ${files.join(" · ")}</div>` : "") +
         (added || removed ? `<div class="diff">${result.html}</div>` : ""),
     ),
@@ -880,9 +950,9 @@ async function diffPage(env: Env, ctx: ExecutionContext, meta: Meta, url: URL): 
 }
 
 type DiffResult = { added: number; removed: number; html: string; partial?: boolean; error?: string };
-const DIFF_REV = 4;
-const MAX_DIFF_BYTES = 150_000;
-const MAX_DIFF_LINES = 2000;
+const DIFF_REV = 5;
+const MAX_DIFF_BYTES = 100_000;
+const MAX_DIFF_LINES = 1000;
 
 async function cachedDiff(
   env: Env,
@@ -962,7 +1032,7 @@ function diff(a: string[], b: string[]): Op[] {
 
 function renderDiff(ops: Op[]): string {
   const ctx = 2;
-  let budget = 4_000;
+  let budget = 12_000;
   const out: string[] = [];
   const row = (cls: string, body: string) => out.push(`<div class="${cls}">${body}</div>`);
   for (let i = 0; i < ops.length; ) {
@@ -982,10 +1052,9 @@ function renderDiff(ops: Op[]): string {
       const dels = ops.slice(i, j).filter(([o]) => o === -1).map(([, t]) => t);
       const ins = ops.slice(i, j).filter(([o]) => o === 1).map(([, t]) => t);
       const pairs = dels.map((t, k) => {
-        if (k >= ins.length) return null;
-        const [from, to] = [t.split(/(\s+)/), ins[k].split(/(\s+)/)];
-        budget -= from.length + to.length;
-        return budget > 0 && from.length + to.length < 200 ? words(from, to) : null;
+        if (k >= ins.length || t.length + ins[k].length > 1200) return null;
+        budget -= t.length + ins[k].length;
+        return budget > 0 ? words(t.split(/(\s+)/), ins[k].split(/(\s+)/)) : null;
       });
       dels.forEach((t, k) => row("del", pairs[k]?.[0] ?? esc(t)));
       ins.forEach((t, k) => row("ins", pairs[k]?.[1] ?? esc(t)));
@@ -1019,15 +1088,16 @@ function textLines(html: string): string[] {
 }
 
 function stripHidden(html: string): string {
-  const lower = html.toLowerCase();
-  const open = /<(script|style|head|template|svg|noscript)\b/g;
+  const open = /<(script|style|head|template|svg|noscript)\b/gi;
   let out = "";
   let last = 0;
-  for (let m; (m = open.exec(lower)); ) {
+  for (let m; (m = open.exec(html)); ) {
     out += `${html.slice(last, m.index)}\n`;
-    const close = lower.indexOf(`</${m[1]}`, open.lastIndex);
-    if (close < 0) return out;
-    last = lower.indexOf(">", close) + 1 || lower.length;
+    const close = new RegExp(`</${m[1]}`, "gi");
+    close.lastIndex = open.lastIndex;
+    const end = close.exec(html);
+    if (!end) return out;
+    last = html.indexOf(">", end.index) + 1 || html.length;
     open.lastIndex = last;
   }
   return out + html.slice(last);
