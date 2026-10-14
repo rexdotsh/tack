@@ -599,7 +599,7 @@ async function collectFile(abs: string, files: Record<string, Uint8Array>, budge
     for (const ref of localRefs(text, ext === ".css")) {
       const target = path.posix.normalize(path.posix.join(from, ref.endsWith("/") ? `${ref}index.html` : ref));
       if (target === main && main !== "index.html") files[main] = html;
-      const candidates = path.posix.extname(target) ? [target] : [target, `${target}.html`, `${target}/index.html`];
+      const candidates = [target, `${target}.html`, `${target}/index.html`];
       for (const candidate of candidates) {
         if (Object.hasOwn(files, candidate) || candidate === main) break;
         if (tried.has(candidate) || candidate.startsWith("../") || candidate.split("/").some((seg) => seg.startsWith("."))) continue;
@@ -631,7 +631,7 @@ function localRefs(text: string, css: boolean): string[] {
     if (ref) refs.push(ref);
   };
   const value = (m: RegExpMatchArray) => m[2] ?? m[3] ?? m[4];
-  for (const m of text.matchAll(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi)) add(m[2]);
+  for (const m of text.matchAll(/url\(\s*(?:"([^"]*)"|'([^']*)'|([^'"()\s]+))\s*\)/gi)) add(m[1] ?? m[2] ?? m[3]);
   for (const m of text.matchAll(/@import\s+(['"])([^'"]+)\1/gi)) add(m[2]);
   if (!css) {
     for (const m of text.matchAll(/\s(src|href|poster)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/gi)) add(value(m));
