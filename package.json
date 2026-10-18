@@ -11,7 +11,7 @@
     "deploy": "wrangler deploy",
     "types": "wrangler types --include-env=false",
     "check": "bun run types >/dev/null && tsc --noEmit && tsc --noEmit -p cli",
-    "build": "rm -rf dist && mkdir dist && bun build cli/tack.ts --target=node --outfile=dist/cli && cp skill/tack/SKILL.md dist/skill.md && cp cli/install.sh dist/install && test \"$(ls -A dist | tr '\\n' ' ')\" = 'cli install skill.md '"
+    "build": "rm -rf dist && mkdir dist && bun build cli/tack.ts --target=node --outfile=dist/cli && cp skill/tack/SKILL.md dist/skill.md && cp cli/install.sh dist/install && cp public/* dist/ && test \"$(ls -A dist | tr '\\n' ' ')\" = 'apple-touch-icon.png cli favicon.ico favicon.svg install skill.md '"
   },
   "devDependencies": {
     "@types/node": "^26.6.4",
