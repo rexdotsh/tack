@@ -834,7 +834,9 @@ input:focus,select:focus,button:focus{outline:none;border-color:var(--mute)}
 table{width:100%;border-collapse:collapse;margin-top:12px}td{padding:10px 8px;border-top:1px solid var(--line);vertical-align:top}
 td+td{white-space:nowrap;text-align:right;color:var(--mute);font-size:13px}.note{margin-top:2px}.empty{padding:32px 0;color:var(--mute)}
 .cmp{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:12px 0 6px}
-select,button{font:inherit;font-size:13px;color:var(--fg);background:transparent;border:1px solid var(--line);border-radius:6px;padding:3px 6px;cursor:pointer}
+select,button{font:inherit;font-size:13px;color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:3px 6px;cursor:pointer}
+option{color:var(--fg);background:var(--bg)}
+@supports (appearance:base-select){select,::picker(select){appearance:base-select}select{display:inline-flex;align-items:center;gap:6px;padding:3px 8px}select::picker-icon{color:var(--mute);font-size:10px}::picker(select){max-height:min(60vh,420px);margin-top:4px;padding:4px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);box-shadow:0 10px 30px -10px rgba(0,0,0,.35)}option{padding:4px 10px;border-radius:5px;font-variant-numeric:tabular-nums}option::checkmark{display:none}option:hover,option:focus-visible{background:var(--line)}option:checked{color:var(--acc);font-weight:600}}
 .diff{margin-top:16px;border:1px solid var(--line);border-radius:10px;overflow:hidden;font-size:14px;line-height:1.55}
 .diff>div{position:relative;padding:3px 12px 3px 30px;white-space:pre-wrap;overflow-wrap:anywhere}
 .diff .eq{color:var(--mute)}.diff .del{background:rgba(239,68,68,.1)}.diff .ins{background:rgba(34,197,94,.1)}
