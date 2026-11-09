@@ -686,7 +686,28 @@ async function readBlob(env: Env, ctx: ExecutionContext, slug: string, hash: str
   return mine;
 }
 
+const SOCKET_JS = `var socket = function (url, onMessage, onOpen, alive) {
+    var ws = null, tries = 0, opened = 0;
+    var connect = function () {
+      if (ws || !alive()) return;
+      ws = new WebSocket(url);
+      ws.onopen = function () { opened = Date.now(); onOpen(); };
+      ws.onmessage = function (m) { onMessage(m.data); };
+      ws.onclose = function () {
+        ws = null;
+        if (opened && Date.now() - opened > 30000) tries = 0;
+        opened = 0;
+        if (alive() && tries < 6) setTimeout(connect, 1000 * Math.pow(2, tries++));
+      };
+    };
+    document.addEventListener("visibilitychange", function () {
+      if (document.visibilityState === "visible" && !ws) { tries = 0; connect(); }
+    });
+    connect();
+  };`;
+
 const BAR_JS = `(function (d) {
+  ${SOCKET_JS}
   var e = function (s) { return String(s).replace(/[&"'<>]/g, function (c) { return "&#" + c.charCodeAt(0) + ";"; }); };
   var base = location.origin + "/" + d.slug + "/";
   var href = function (n) { return n === d.latest ? base + d.sub : base + "v/" + n + "/" + d.sub; };
@@ -705,7 +726,7 @@ const BAR_JS = `(function (d) {
       '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="' + path + '"/></svg></a>';
   };
   var when = new Date(d.at).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
-  var dead = false, fresh = false, news = false, tries = 0, ws = null, host, root;
+  var dead = false, fresh = false, news = false, host, root;
   try {
     for (var k = localStorage.length - 1; k >= 0; k--) {
       var key = localStorage.key(k) || "";
@@ -782,23 +803,12 @@ const BAR_JS = `(function (d) {
     }
     render();
   };
-  var opened = 0;
-  var connect = function () {
-    if (dead || ws) return;
-    ws = new WebSocket(base.replace(/^http/, "ws") + "_live");
-    ws.onopen = function () { opened = Date.now(); };
-    ws.onmessage = function (m) { try { sync(JSON.parse(m.data)); } catch (_) {} };
-    ws.onclose = function () {
-      ws = null;
-      if (opened && Date.now() - opened > 30000) tries = 0;
-      opened = 0;
-      if (!dead && tries < 6) setTimeout(connect, 1000 * Math.pow(2, tries++));
-    };
-  };
-  document.addEventListener("visibilitychange", function () {
-    if (document.visibilityState === "visible" && !ws) { tries = 0; connect(); }
-  });
-  connect();
+  socket(
+    base.replace(/^http/, "ws") + "_live",
+    function (data) { try { sync(JSON.parse(data)); } catch (_) {} },
+    function () {},
+    function () { return !dead; }
+  );
 })(__DATA__);`;
 type BarData = {
   slug: string;
@@ -876,38 +886,35 @@ ages();
 setInterval(ages, 60000);
 if (q) q.addEventListener("input", filter);`;
 
-const LIST_JS = `(() => {
-  let ws = null, tries = 0, opened = 0, timer = 0, stale = false;
-  const refresh = async () => {
-    const res = await fetch("/", { cache: "no-store" }).catch(() => null);
+const LIST_JS = `(function () {
+  ${SOCKET_JS}
+  var timer = 0, stale = false, first = true;
+  var refresh = async function () {
+    stale = false;
+    var res = await fetch("/", { cache: "no-store" }).catch(function () { return null; });
     if (!res || !res.ok) return;
-    const next = new DOMParser().parseFromString(await res.text(), "text/html");
-    const [oldBody, newBody] = [document, next].map((d) => d.querySelector("tbody"));
+    var next = new DOMParser().parseFromString(await res.text(), "text/html");
+    var oldBody = document.querySelector("tbody"), newBody = next.querySelector("tbody");
     if (!oldBody || !newBody) return location.reload();
     oldBody.innerHTML = newBody.innerHTML;
     document.getElementById("count").textContent = next.getElementById("count").textContent;
     ages();
     filter();
   };
-  const soon = () => { clearTimeout(timer); timer = setTimeout(refresh, 300); };
-  const connect = () => {
-    if (ws) return;
-    ws = new WebSocket(location.origin.replace(/^http/, "ws") + "/_live");
-    ws.onopen = () => { opened = Date.now(); if (stale) soon(); stale = false; };
-    ws.onmessage = soon;
-    ws.onclose = () => {
-      ws = null;
-      stale = true;
-      if (opened && Date.now() - opened > 30000) tries = 0;
-      opened = 0;
-      if (tries < 6) setTimeout(connect, 1000 * 2 ** tries++);
-    };
+  var changed = function () {
+    if (document.visibilityState !== "visible") { stale = true; return; }
+    clearTimeout(timer);
+    timer = setTimeout(refresh, 300);
   };
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState !== "visible") return;
-    if (!ws) { tries = 0; connect(); }
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "visible" && stale) changed();
   });
-  connect();
+  socket(
+    location.origin.replace(/^http/, "ws") + "/_live",
+    changed,
+    function () { if (!first) changed(); first = false; },
+    function () { return true; }
+  );
 })();`;
 
 
