@@ -89,6 +89,14 @@ export class Live extends DurableObject<Env> {
     }
   }
 
+  ping() {
+    for (const ws of this.ctx.getWebSockets()) {
+      try {
+        ws.send("{}");
+      } catch {}
+    }
+  }
+
   webSocketMessage(ws: WebSocket) {
     ws.close(1008, "read-only");
   }
@@ -101,6 +109,7 @@ export class Live extends DurableObject<Env> {
 }
 
 const live = (env: Env, slug: string) => env.LIVE.get(env.LIVE.idFromName(slug));
+const LIST_LIVE = "__list__";
 
 async function nextGen(env: Env, slug: string): Promise<number> {
   try {
@@ -112,11 +121,8 @@ async function nextGen(env: Env, slug: string): Promise<number> {
 }
 
 async function notify(env: Env, slug: string, state: LiveState) {
-  try {
-    await live(env, slug).notify(state);
-  } catch (err) {
-    console.error("live notify failed", err);
-  }
+  const results = await Promise.allSettled([live(env, slug).notify(state), live(env, LIST_LIVE).ping()]);
+  for (const r of results) if (r.status === "rejected") console.error("live notify failed", r.reason);
 }
 
 export default {
@@ -160,6 +166,13 @@ async function route(req: Request, env: Env, ctx: ExecutionContext, url: URL): P
 }
 
 async function listSite(req: Request, env: Env, url: URL): Promise<Response> {
+  if (url.pathname === "/_live") {
+    if (req.headers.get("upgrade") !== "websocket") return fail(426, "expected a websocket");
+    if (req.headers.get("origin") !== `${url.protocol}//${env.LIST_HOST}` || !(await isViewer(req, env))) {
+      return fail(403, "forbidden");
+    }
+    return live(env, LIST_LIVE).fetch(req);
+  }
   let res: Response;
   if (url.pathname === "/") res = (await isViewer(req, env)) ? await indexPage(env, `${url.protocol}//${env.DOCS_HOST}`) : locked();
   else if (url.pathname === "/login") res = req.method === "POST" ? await login(req, env) : loginPage();
@@ -673,7 +686,28 @@ async function readBlob(env: Env, ctx: ExecutionContext, slug: string, hash: str
   return mine;
 }
 
+const SOCKET_JS = `var socket = function (url, onMessage, onOpen, alive) {
+    var ws = null, tries = 0, opened = 0;
+    var connect = function () {
+      if (ws || !alive()) return;
+      ws = new WebSocket(url);
+      ws.onopen = function () { opened = Date.now(); onOpen(); };
+      ws.onmessage = function (m) { onMessage(m.data); };
+      ws.onclose = function () {
+        ws = null;
+        if (opened && Date.now() - opened > 30000) tries = 0;
+        opened = 0;
+        if (alive() && tries < 6) setTimeout(connect, 1000 * Math.pow(2, tries++));
+      };
+    };
+    document.addEventListener("visibilitychange", function () {
+      if (document.visibilityState === "visible" && !ws) { tries = 0; connect(); }
+    });
+    connect();
+  };`;
+
 const BAR_JS = `(function (d) {
+  ${SOCKET_JS}
   var e = function (s) { return String(s).replace(/[&"'<>]/g, function (c) { return "&#" + c.charCodeAt(0) + ";"; }); };
   var base = location.origin + "/" + d.slug + "/";
   var href = function (n) { return n === d.latest ? base + d.sub : base + "v/" + n + "/" + d.sub; };
@@ -692,7 +726,7 @@ const BAR_JS = `(function (d) {
       '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="' + path + '"/></svg></a>';
   };
   var when = new Date(d.at).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
-  var dead = false, fresh = false, news = false, tries = 0, ws = null, host, root;
+  var dead = false, fresh = false, news = false, host, root;
   try {
     for (var k = localStorage.length - 1; k >= 0; k--) {
       var key = localStorage.key(k) || "";
@@ -769,23 +803,12 @@ const BAR_JS = `(function (d) {
     }
     render();
   };
-  var opened = 0;
-  var connect = function () {
-    if (dead || ws) return;
-    ws = new WebSocket(base.replace(/^http/, "ws") + "_live");
-    ws.onopen = function () { opened = Date.now(); };
-    ws.onmessage = function (m) { try { sync(JSON.parse(m.data)); } catch (_) {} };
-    ws.onclose = function () {
-      ws = null;
-      if (opened && Date.now() - opened > 30000) tries = 0;
-      opened = 0;
-      if (!dead && tries < 6) setTimeout(connect, 1000 * Math.pow(2, tries++));
-    };
-  };
-  document.addEventListener("visibilitychange", function () {
-    if (document.visibilityState === "visible" && !ws) { tries = 0; connect(); }
-  });
-  connect();
+  socket(
+    base.replace(/^http/, "ws") + "_live",
+    function (data) { try { sync(JSON.parse(data)); } catch (_) {} },
+    function () {},
+    function () { return !dead; }
+  );
 })(__DATA__);`;
 type BarData = {
   slug: string;
@@ -845,21 +868,58 @@ option{color:var(--fg);background:var(--bg)}
 .diff ins{background:rgba(34,197,94,.28);text-decoration:none;border-radius:2px}
 .diff .gap{padding:2px 12px;text-align:center;font-size:12px;color:var(--mute);background:rgba(127,127,127,.08)}`;
 
-const PAGE_JS = `for (const t of document.querySelectorAll("time")) {
-  const d = new Date(t.dateTime), s = (Date.now() - d) / 1000;
-  t.title = d.toLocaleString();
-  t.textContent = s < 60 ? "just now" : s < 3600 ? Math.floor(s / 60) + "m ago" : s < 86400 ? Math.floor(s / 3600) + "h ago"
-    : s < 604800 ? Math.floor(s / 86400) + "d ago" : d.toLocaleDateString();
-}
+const PAGE_JS = `const ages = () => {
+  for (const t of document.querySelectorAll("time")) {
+    const d = new Date(t.dateTime), s = (Date.now() - d) / 1000;
+    t.title = d.toLocaleString();
+    t.textContent = s < 60 ? "just now" : s < 3600 ? Math.floor(s / 60) + "m ago" : s < 86400 ? Math.floor(s / 3600) + "h ago"
+      : s < 604800 ? Math.floor(s / 86400) + "d ago" : d.toLocaleDateString();
+  }
+};
 const q = document.getElementById("q");
-if (q) q.addEventListener("input", () => {
+const filter = () => {
+  if (!q) return;
   const v = q.value.toLowerCase();
   for (const r of document.querySelectorAll("tbody tr")) r.hidden = !r.textContent.toLowerCase().includes(v);
-});`;
+};
+ages();
+setInterval(ages, 60000);
+if (q) q.addEventListener("input", filter);`;
+
+const LIST_JS = `(function () {
+  ${SOCKET_JS}
+  var timer = 0, stale = false, first = true;
+  var refresh = async function () {
+    stale = false;
+    var res = await fetch("/", { cache: "no-store" }).catch(function () { return null; });
+    if (!res || !res.ok) return;
+    var next = new DOMParser().parseFromString(await res.text(), "text/html");
+    var oldBody = document.querySelector("tbody"), newBody = next.querySelector("tbody");
+    if (!oldBody || !newBody) return location.reload();
+    oldBody.innerHTML = newBody.innerHTML;
+    document.getElementById("count").textContent = next.getElementById("count").textContent;
+    ages();
+    filter();
+  };
+  var changed = function () {
+    if (document.visibilityState !== "visible") { stale = true; return; }
+    clearTimeout(timer);
+    timer = setTimeout(refresh, 300);
+  };
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "visible" && stale) changed();
+  });
+  socket(
+    location.origin.replace(/^http/, "ws") + "/_live",
+    changed,
+    function () { if (!first) changed(); first = false; },
+    function () { return true; }
+  );
+})();`;
 
 
-function page(title: string, body: string): string {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title><link rel="icon" href="/favicon.svg"><style>${CSS}</style></head><body>${body}<script>${PAGE_JS}</script></body></html>`;
+function page(title: string, body: string, extraJs = ""): string {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title><link rel="icon" href="/favicon.svg"><style>${CSS}</style></head><body>${body}<script>${PAGE_JS}\n${extraJs}</script></body></html>`;
 }
 
 const time = (iso: string) => `<time datetime="${esc(iso)}">${esc(iso.slice(0, 16).replace("T", " "))}</time>`;
@@ -876,10 +936,11 @@ async function indexPage(env: Env, docsOrigin: string): Promise<Response> {
   return html(
     page(
       "tack",
-      `<h1>📌 tack</h1><div class="m">${docs.length} doc${docs.length === 1 ? "" : "s"}</div>` +
+      `<h1>📌 tack</h1><div class="m" id="count">${docs.length} doc${docs.length === 1 ? "" : "s"}</div>` +
         (docs.length
           ? `<input id="q" placeholder="Filter…" autofocus><table><tbody>${rows}</tbody></table>`
           : `<div class="empty">Nothing here yet. Run <code>tack upload ./plan.html</code>.</div>`),
+      LIST_JS,
     ),
   );
 }
