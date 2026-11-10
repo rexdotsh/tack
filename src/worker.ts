@@ -242,22 +242,30 @@ async function privateSite(req: Request, env: Env, ctx: ExecutionContext, url: U
 
 const privateOn = (env: Env) => Boolean(env.PRIVATE_HOST && env.ACCESS_TEAM_DOMAIN && env.ACCESS_AUD);
 
-let accessKeys: { at: number; keys: Map<string, CryptoKey> } | undefined;
+let accessKeys: Map<string, CryptoKey> | undefined;
+let accessTried = 0;
+let accessLoading: Promise<void> | undefined;
+
+async function loadAccessKeys(env: Env): Promise<void> {
+  const res = await fetch(`${env.ACCESS_TEAM_DOMAIN}/cdn-cgi/access/certs`);
+  if (!res.ok) throw new Error(`access certs: HTTP ${res.status}`);
+  const keys = new Map<string, CryptoKey>();
+  for (const jwk of (await res.json<{ keys: (JsonWebKey & { kid: string })[] }>()).keys) {
+    if (jwk.kty !== "RSA") continue;
+    const alg = { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" };
+    keys.set(jwk.kid, await crypto.subtle.importKey("jwk", jwk, alg, false, ["verify"]));
+  }
+  accessKeys = keys;
+}
 
 async function accessKey(env: Env, kid: string): Promise<CryptoKey | undefined> {
-  const age = accessKeys ? Date.now() - accessKeys.at : Infinity;
-  if (age > 3_600_000 || (age > 60_000 && !accessKeys?.keys.has(kid))) {
-    const res = await fetch(`${env.ACCESS_TEAM_DOMAIN}/cdn-cgi/access/certs`);
-    if (!res.ok) throw new Error(`access certs: HTTP ${res.status}`);
-    const keys = new Map<string, CryptoKey>();
-    for (const jwk of (await res.json<{ keys: (JsonWebKey & { kid: string })[] }>()).keys) {
-      if (jwk.kty !== "RSA") continue;
-      const alg = { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" };
-      keys.set(jwk.kid, await crypto.subtle.importKey("jwk", jwk, alg, false, ["verify"]));
-    }
-    accessKeys = { at: Date.now(), keys };
+  const age = Date.now() - accessTried;
+  if (!accessLoading && (age > 3_600_000 || (age > 60_000 && !accessKeys?.has(kid)))) {
+    accessTried = Date.now();
+    accessLoading = loadAccessKeys(env).finally(() => (accessLoading = undefined));
   }
-  return accessKeys?.keys.get(kid);
+  if (accessLoading) await accessLoading;
+  return accessKeys?.get(kid);
 }
 
 const unb64url = (s: string) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
