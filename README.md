@@ -3,7 +3,7 @@
 An agent runs `tack upload plan.html` and replies with a link. Uploading again adds a version under the same link, and open tabs update live.
 
 - **Secret links.** Anyone with a link can read it; nobody can guess one.
-- **Private docs.** `--private` docs open only in your own browsers, on a separate host.
+- **Private docs.** `--private` docs live on a separate host behind Cloudflare Access, so only you can open them.
 - **Versions.** `/id` is the latest, `/id/v/2` is pinned, plus `/_history` and `/_diff`.
 - **Anything goes.** Served byte-for-byte: scripts, assets, multi-page folders.
 - **Free plan friendly.** One Worker, one R2 bucket, one Durable Object.
@@ -11,7 +11,7 @@ An agent runs `tack upload plan.html` and replies with a link. Uploading again a
 ## Setup
 
 1. Create an R2 bucket named `tack`.
-2. Workers & Pages → Import this repo. Deploy command `bunx wrangler deploy`, build variable `BUN_VERSION=1.4.0`. If you fork it, put your domains in `wrangler.jsonc` (`routes` and `vars`: docs, the doc list and private docs each on their own host), `DEFAULT_URL` in `cli/tack.ts` and `base` in `cli/install.sh`.
+2. Workers & Pages → Import this repo. Deploy command `bunx wrangler deploy`, build variable `BUN_VERSION=1.4.0`. If you fork it, put your domains in `wrangler.jsonc` (`routes` and `vars`: docs and the doc list each on their own host), `DEFAULT_URL` in `cli/tack.ts` and `base` in `cli/install.sh`.
 3. Install the CLI and skill (running from the repo needs Node 22.18+):
 
 ```sh
@@ -22,6 +22,8 @@ ln -s "$PWD/skill/tack" ~/.agents/skills/tack
 tack setup   # creates a token and sets it on the Worker
 tack open    # unlocks the doc list (list.tack.rex.wf) in your browser
 ```
+
+4. Optional, for private docs: in Zero Trust → Access → Applications, add a self-hosted application for the private host (`private.tack.rex.wf`; not "Protect this Worker", which breaks WebSockets) with a policy that allows only your email. Put your team domain (`https://<team>.cloudflareaccess.com`) and the application's AUD tag in `wrangler.jsonc` as `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD`. Without all three of `PRIVATE_HOST`, `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD`, private docs are off.
 
 Any other machine with Node 20+ installs the CLI and skill from your instance:
 
@@ -46,7 +48,7 @@ tack update
 ## Dev
 
 ```sh
-printf 'TACK_TOKEN=dev\nDOCS_HOST=127.0.0.1:8787\nLIST_HOST=list.localhost:8787\nPRIVATE_HOST=private.localhost:8787\n' > .dev.vars
+printf 'TACK_TOKEN=dev\nDOCS_HOST=127.0.0.1:8787\nLIST_HOST=list.localhost:8787\n' > .dev.vars
 bun run dev
 TACK_URL=http://127.0.0.1:8787 TACK_TOKEN=dev tack upload plan.html
 ```

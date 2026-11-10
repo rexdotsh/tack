@@ -7,6 +7,8 @@ interface Env {
   DOCS_HOST?: string;
   LIST_HOST?: string;
   PRIVATE_HOST?: string;
+  ACCESS_TEAM_DOMAIN?: string;
+  ACCESS_AUD?: string;
 }
 
 type Version = {
@@ -176,7 +178,7 @@ export default {
 async function route(req: Request, env: Env, ctx: ExecutionContext, url: URL): Promise<Response> {
   if (url.pathname === "/robots.txt") return text("User-agent: *\nDisallow: /\n");
   if (env.LIST_HOST && url.host === env.LIST_HOST) return listSite(req, env, url);
-  if (env.PRIVATE_HOST && url.host === env.PRIVATE_HOST) return privateSite(req, env, ctx, url);
+  if (env.PRIVATE_HOST && url.host === env.PRIVATE_HOST) return privateOn(env) ? privateSite(req, env, ctx, url) : notFound();
   if (url.pathname === "/") {
     if (!env.LIST_HOST) return notFound();
     return new Response(null, {
@@ -206,9 +208,8 @@ async function listSite(req: Request, env: Env, url: URL): Promise<Response> {
   }
   let res: Response;
   if (url.pathname === "/") res = (await isViewer(req, env)) ? await indexPage(env, url) : locked();
-  else if (url.pathname === "/login") {
-    res = req.method === "POST" ? await login(req, env) : loginPage(env.PRIVATE_HOST ? `${url.protocol}//${env.PRIVATE_HOST}/login` : "");
-  } else res = notFound();
+  else if (url.pathname === "/login") res = req.method === "POST" ? await login(req, env) : loginPage();
+  else res = notFound();
   return isolate(res, "'none'");
 }
 
@@ -229,13 +230,57 @@ async function privateSite(req: Request, env: Env, ctx: ExecutionContext, url: U
   const mode = req.headers.get("sec-fetch-mode");
   if (site && site !== "same-origin" && site !== "none" && mode !== "navigate") return fail(403, "forbidden");
   if (url.pathname === "/") return redirect(`${url.protocol}//${env.LIST_HOST}/`);
-  if (url.pathname === "/login") return isolate(req.method === "POST" ? await login(req, env) : loginPage(`${url.protocol}//${env.LIST_HOST}/`), "'none'");
-  if (!(await isViewer(req, env))) return isolate(locked("This doc is private."), "'none'");
+  if (!(await isOwner(req, env))) {
+    return isolate(html(page("tack", `<h1>📌 tack</h1><p class="m">Private docs need a Cloudflare Access sign-in.</p>`), 403), "'none'");
+  }
   if (url.pathname.endsWith("/_live") && req.headers.get("origin") !== `${url.protocol}//${env.PRIVATE_HOST}`) {
     return fail(403, "forbidden");
   }
   const res = await serveDoc(req, env, ctx, url, "private");
   return res.webSocket ? res : isolate(res, "'self'");
+}
+
+const privateOn = (env: Env) => Boolean(env.PRIVATE_HOST && env.ACCESS_TEAM_DOMAIN && env.ACCESS_AUD);
+
+let accessKeys: { at: number; keys: Map<string, CryptoKey> } | undefined;
+
+async function accessKey(env: Env, kid: string): Promise<CryptoKey | undefined> {
+  const age = accessKeys ? Date.now() - accessKeys.at : Infinity;
+  if (age > 3_600_000 || (age > 60_000 && !accessKeys?.keys.has(kid))) {
+    const res = await fetch(`${env.ACCESS_TEAM_DOMAIN}/cdn-cgi/access/certs`);
+    if (!res.ok) throw new Error(`access certs: HTTP ${res.status}`);
+    const keys = new Map<string, CryptoKey>();
+    for (const jwk of (await res.json<{ keys: (JsonWebKey & { kid: string })[] }>()).keys) {
+      if (jwk.kty !== "RSA") continue;
+      const alg = { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" };
+      keys.set(jwk.kid, await crypto.subtle.importKey("jwk", jwk, alg, false, ["verify"]));
+    }
+    accessKeys = { at: Date.now(), keys };
+  }
+  return accessKeys?.keys.get(kid);
+}
+
+const unb64url = (s: string) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
+
+async function isOwner(req: Request, env: Env): Promise<boolean> {
+  const [head, body, sig, extra] = req.headers.get("cf-access-jwt-assertion")?.split(".") ?? [];
+  if (!sig || extra !== undefined) return false;
+  try {
+    const h = JSON.parse(new TextDecoder().decode(unb64url(head)));
+    const c = JSON.parse(new TextDecoder().decode(unb64url(body)));
+    const now = Date.now() / 1000;
+    const aud = Array.isArray(c.aud) ? c.aud : [c.aud];
+    if (h.alg !== "RS256" || typeof h.kid !== "string") return false;
+    if (c.iss !== env.ACCESS_TEAM_DOMAIN || !aud.includes(env.ACCESS_AUD)) return false;
+    if (!(c.exp > now) || (c.nbf !== undefined && !(c.nbf <= now + 60))) return false;
+    const key = await accessKey(env, h.kid);
+    if (!key) return false;
+    const data = new TextEncoder().encode(`${head}.${body}`);
+    return await crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, unb64url(sig), data);
+  } catch (e) {
+    console.error("access check failed", e);
+    return false;
+  }
 }
 
 async function viewKey(env: Env): Promise<string | null> {
@@ -291,7 +336,7 @@ async function api(req: Request, env: Env, ctx: ExecutionContext, url: URL): Pro
     return json({
       ok: true,
       listUrl: env.LIST_HOST ? `${url.protocol}//${env.LIST_HOST}` : null,
-      privateUrl: env.PRIVATE_HOST ? `${url.protocol}//${env.PRIVATE_HOST}` : null,
+      privateUrl: privateOn(env) ? `${url.protocol}//${env.PRIVATE_HOST}` : null,
     });
   }
   const raw = url.pathname.match(/^\/api\/raw\/([^/]+)(\/.*)?$/);
@@ -398,7 +443,9 @@ async function upload(req: Request, env: Env, url: URL, slug: string): Promise<R
 
     const latest = meta.versions.at(-1);
     const wantPrivate = typeof body.private === "boolean" ? body.private : Boolean(meta.private);
-    if (wantPrivate && !env.PRIVATE_HOST) return fail(400, "private docs need PRIVATE_HOST set on the Worker");
+    if (wantPrivate && !privateOn(env)) {
+      return fail(400, "private docs need PRIVATE_HOST, ACCESS_TEAM_DOMAIN and ACCESS_AUD set on the Worker");
+    }
     if (latest && latest.hash === versionHash && wantPrivate === Boolean(meta.private)) {
       return json(receipt(docsOrigin(env, url, meta.private), meta, latest, true));
     }
@@ -773,17 +820,23 @@ async function readBlob(env: Env, ctx: ExecutionContext, slug: string, hash: str
 
 const SOCKET_JS = `var socket = function (url, onMessage, onOpen, alive) {
     var ws = null, tries = 0, opened = 0;
+    var retry = function () {
+      ws = null;
+      if (opened && Date.now() - opened > 30000) tries = 0;
+      opened = 0;
+      if (alive() && tries < 6) setTimeout(connect, 1000 * Math.pow(2, tries++));
+    };
     var connect = function () {
       if (ws || !alive()) return;
-      ws = new WebSocket(url);
-      ws.onopen = function () { opened = Date.now(); onOpen(); };
-      ws.onmessage = function (m) { onMessage(m.data); };
-      ws.onclose = function () {
-        ws = null;
-        if (opened && Date.now() - opened > 30000) tries = 0;
-        opened = 0;
-        if (alive() && tries < 6) setTimeout(connect, 1000 * Math.pow(2, tries++));
+      var w = (ws = new WebSocket(url));
+      w.onopen = function () { opened = Date.now(); onOpen(); };
+      w.onmessage = function (m) {
+        if (m.data !== '{"gone":true}') return onMessage(m.data);
+        w.onclose = null;
+        w.close();
+        retry();
       };
+      w.onclose = retry;
     };
     document.addEventListener("visibilitychange", function () {
       if (document.visibilityState === "visible" && !ws) { tries = 0; connect(); }
@@ -869,7 +922,6 @@ const BAR_JS = `(function (d) {
   }, 60000);
   var sync = function (s) {
     if (dead || !s) return;
-    if (s.gone) { dead = true; return; }
     var gen = s.gen || 0;
     if (gen < d.gen || (gen === d.gen && !(s.rev > d.rev))) return;
     if (gen > d.gen && d.pinned) { dead = true; return; }
@@ -1275,22 +1327,21 @@ function decodeEntities(s: string): string {
   });
 }
 
-function loginPage(next: string): Response {
+function loginPage(): Response {
   const js = `(async () => {
   const code = location.hash.slice(1);
   history.replaceState(null, "", "/login");
   const say = (t) => (document.getElementById("s").textContent = t);
   if (!code) return say("Run tack open for an unlock link.");
   const res = await fetch("/login", { method: "POST", body: code });
-  const next = ${JSON.stringify(next)};
-  if (!res.ok) return say("That unlock link didn't work or has expired. Run tack open again.");
-  location.replace(next.endsWith("/login") ? next + "#" + code : next || "/");
+  if (res.ok) location.replace("/");
+  else say("That unlock link didn't work or has expired. Run tack open again.");
 })();`;
   return html(page("tack", `<h1>📌 tack</h1><p class="m" id="s">Unlocking…</p><script>${js}</script>`));
 }
 
-function locked(why = "Locked."): Response {
-  return html(page("tack", `<h1>📌 tack</h1><p class="m">${esc(why)} Run <code>tack open</code> for your unlock link.</p>`), 401);
+function locked(): Response {
+  return html(page("tack", `<h1>📌 tack</h1><p class="m">Locked. Run <code>tack open</code> for your unlock link.</p>`), 401);
 }
 
 function notFound(message = "Not found.", slug?: string): Response {

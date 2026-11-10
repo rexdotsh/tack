@@ -36,7 +36,7 @@ upload:
                (pick your own and the link is guessable; new docs get a random one)
   --new        always create a new doc (with --slug: fail if the slug is taken)
                with neither, re-uploading the same path updates the same doc
-  --private    only your unlocked browsers can open it (served on the private host)
+  --private    serve it on the private host, behind Cloudflare Access
   --public     make a private doc public again (otherwise a doc keeps its mode)
   --title <t>  doc title (default: the page's <title> or first <h1>)
   --note <n>   what changed in this version, shown in the history
@@ -173,7 +173,7 @@ async function upload(argv: string[]) {
   const copied = process.stdout.isTTY && (await copy(receipt.url));
   console.log(`${receipt.url}${copied ? "  (copied)" : ""}`);
   console.log(`  v${receipt.version} (${status}) · pinned: ${receipt.versionUrl}`);
-  if (receipt.private) console.log("  private: opens only in browsers unlocked with `tack open`");
+  if (receipt.private) console.log("  private: only opens after a Cloudflare Access sign-in");
   if (extras.length && !stdin && (await stat(abs)).isFile()) {
     const shown = extras.slice(0, 5).join(", ");
     console.log(`  + ${shown}${extras.length > 5 ? `, and ${extras.length - 5} more` : ""}`);
