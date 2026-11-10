@@ -19,7 +19,7 @@ const common = { url: { type: "string" }, json: { type: "boolean" } } as const;
 const HELP = `tack - publish HTML docs to your tack instance
 
 Usage:
-  tack upload <file.html|dir|-> [--slug <slug>] [--new] [--title <t>] [--note <n>] [--json]
+  tack upload <file.html|dir|-> [--slug <slug>] [--new] [--private|--public] [--title <t>] [--note <n>] [--json]
   tack get <slug|url> [--v <n>]     print a doc's HTML to stdout
   tack list [--match <words>] [--json]  find docs by title or slug
   tack open [slug]                  open a doc in your browser; no slug: unlock the doc list
@@ -36,6 +36,8 @@ upload:
                (pick your own and the link is guessable; new docs get a random one)
   --new        always create a new doc (with --slug: fail if the slug is taken)
                with neither, re-uploading the same path updates the same doc
+  --private    serve it on the private host, behind Cloudflare Access
+  --public     make a private doc public again (otherwise a doc keeps its mode)
   --title <t>  doc title (default: the page's <title> or first <h1>)
   --note <n>   what changed in this version, shown in the history
   --json       machine-readable receipt
@@ -51,12 +53,21 @@ type Receipt = {
   title: string;
   version: number;
   versions: number;
+  private: boolean;
   unchanged: boolean;
   url: string;
   versionUrl: string;
   historyUrl: string;
 };
-type DocSummary = { slug: string; title: string; updatedAt: string; latest: number; versions: number; url: string };
+type DocSummary = {
+  slug: string;
+  title: string;
+  updatedAt: string;
+  latest: number;
+  versions: number;
+  private: boolean;
+  url: string;
+};
 
 class HttpError extends Error {
   status: number;
@@ -94,8 +105,11 @@ async function upload(argv: string[]) {
       new: { type: "boolean" },
       title: { type: "string" },
       note: { type: "string" },
+      private: { type: "boolean" },
+      public: { type: "boolean" },
     },
   });
+  if (o.private && o.public) throw new Error("pick one of --private and --public");
   if (positionals.length !== 1) {
     throw new Error("usage: tack upload <file.html|dir|-> [--slug s] [--new] [--title t] [--note n] [--json]");
   }
@@ -120,6 +134,7 @@ async function upload(argv: string[]) {
     title: title || undefined,
     note: o.note || undefined,
     create: Boolean(o.new) || auto,
+    private: o.private ? true : o.public ? false : undefined,
   });
   const commit = () =>
     api<Receipt>(cfg, `/api/docs/${encodeURIComponent(slug!)}`, {
@@ -158,6 +173,7 @@ async function upload(argv: string[]) {
   const copied = process.stdout.isTTY && (await copy(receipt.url));
   console.log(`${receipt.url}${copied ? "  (copied)" : ""}`);
   console.log(`  v${receipt.version} (${status}) · pinned: ${receipt.versionUrl}`);
+  if (receipt.private) console.log("  private: only opens after a Cloudflare Access sign-in");
   if (extras.length && !stdin && (await stat(abs)).isFile()) {
     const shown = extras.slice(0, 5).join(", ");
     console.log(`  + ${shown}${extras.length > 5 ? `, and ${extras.length - 5} more` : ""}`);
@@ -211,7 +227,21 @@ async function get(argv: string[]) {
     : new URL(`/${ref.replace(/^\/+|\/+$/g, "")}/${o.v ? `v/${o.v}/` : ""}`, cfg.url);
   url.hash = "";
   url.searchParams.set("raw", "1");
-  const res = await request(cfg, url.href);
+  const viaApi = () => {
+    const api = new URL(`/api/raw${url.pathname}`, cfg.url);
+    api.search = url.search;
+    return request(cfg, api.href);
+  };
+  const ownHost = url.origin === new URL(cfg.url).origin;
+  const privateHost =
+    !ownHost && cfg.token
+      ? await api<{ privateUrl: string | null }>(cfg, "/api/info").then(
+          (i) => i.privateUrl !== null && new URL(i.privateUrl).origin === url.origin,
+          () => false,
+        )
+      : false;
+  let res = privateHost ? await viaApi() : await request(cfg, url.href);
+  if (res.status === 404 && ownHost && cfg.token) res = await viaApi();
   if (!res.ok) throw new Error(`HTTP ${res.status} for ${url.href}`);
   const version = res.headers.get("x-tack-version");
   if (version) {
@@ -233,7 +263,7 @@ async function list(argv: string[]) {
   const width = Math.max(...docs.map((d) => d.slug.length));
   for (const d of docs) {
     const when = d.updatedAt.slice(0, 16).replace("T", " ");
-    console.log(`${d.slug.padEnd(width)}  ${`v${d.latest}`.padEnd(4)}  ${when}  ${d.title}`);
+    console.log(`${d.slug.padEnd(width)}  ${`v${d.latest}`.padEnd(4)}  ${when}  ${d.private ? "🔒 " : ""}${d.title}`);
   }
 }
 
@@ -288,7 +318,10 @@ async function open(argv: string[]) {
   const cfg = await loadConfig(o.url);
   const ref = positionals[0];
   let target: string;
-  if (ref) target = new URL(/^https?:\/\//i.test(ref) ? ref : `${cfg.url}/${ref.replace(/^\/+|\/+$/g, "")}/`).href;
+  if (ref && !/^https?:\/\//i.test(ref) && cfg.token) {
+    const slug = ref.replace(/^\/+|\/+$/g, "");
+    target = (await api<{ url: string }>(cfg, `/api/docs/${encodeURIComponent(slug)}`)).url;
+  } else if (ref) target = new URL(/^https?:\/\//i.test(ref) ? ref : `${cfg.url}/${ref.replace(/^\/+|\/+$/g, "")}/`).href;
   else {
     if (!cfg.token) throw new Error("no token yet (run `tack setup`)");
     const { listUrl } = await api<{ listUrl: string | null }>(cfg, "/api/info");

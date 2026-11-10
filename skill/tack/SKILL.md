@@ -16,6 +16,10 @@ description: Use when the user wants an HTML write-up (plan, spec, report, findi
    For a single page you don't need a file: pipe it in with `tack upload - --new --json <<'EOF' ... EOF`. Updates work the same way with `tack upload - --slug <slug>`.
 3. Reply with the receipt's `url`. It's only published once the receipt has `"ok": true`.
 
+## Sensitive docs
+
+If the doc contains anything sensitive (credentials, personal data, unreleased plans the user wouldn't want leaked), add `--private`: it's served at `private.tack.rex.wf/<id>` and only opens in the user's own browsers. Don't use it for docs meant to be shared with other people. Updates keep the doc private without the flag; only `--public` makes it public again, and only do that if the user asks.
+
 ## Update a doc
 
 Run the receipt's `updateCommand` with a note:

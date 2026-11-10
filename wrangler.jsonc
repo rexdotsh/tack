@@ -8,9 +8,16 @@
   "preview_urls": false,
   "routes": [
     { "pattern": "tack.rex.wf", "custom_domain": true },
-    { "pattern": "list.tack.rex.wf", "custom_domain": true }
+    { "pattern": "list.tack.rex.wf", "custom_domain": true },
+    { "pattern": "private.tack.rex.wf", "custom_domain": true }
   ],
-  "vars": { "DOCS_HOST": "tack.rex.wf", "LIST_HOST": "list.tack.rex.wf" },
+  "vars": {
+    "DOCS_HOST": "tack.rex.wf",
+    "LIST_HOST": "list.tack.rex.wf",
+    "PRIVATE_HOST": "private.tack.rex.wf",
+    "ACCESS_TEAM_DOMAIN": "https://rexdotsh.cloudflareaccess.com",
+    "ACCESS_AUD": "2aec393085903d069413e5604c61b6ed115a3d12b6d3058be5f17cffe0a87933"
+  },
 
   "build": { "command": "bun run build" },
   "assets": { "directory": "./dist" },
