@@ -6,6 +6,7 @@ interface Env {
   TACK_TOKEN?: string;
   DOCS_HOST?: string;
   LIST_HOST?: string;
+  PRIVATE_HOST?: string;
 }
 
 type Version = {
@@ -29,10 +30,19 @@ type Meta = {
   gen?: number;
   lock?: { reason: string; at: number; to?: string; from?: string; phase?: "cleanup" };
   renamedFrom?: { slug: string; gen: number };
+  private?: boolean;
   versions: Version[];
 };
-type DocSummary = { slug: string; title: string; updatedAt: string; latest: number; versions: number };
-type UploadBody = { files?: Record<string, unknown>; size?: number; title?: string; note?: string; create?: boolean };
+type DocSummary = { slug: string; title: string; updatedAt: string; latest: number; versions: number; private: boolean };
+type UploadBody = {
+  files?: Record<string, unknown>;
+  size?: number;
+  title?: string;
+  note?: string;
+  create?: boolean;
+  private?: boolean;
+};
+type Scope = "public" | "private" | "any";
 type LiveState = {
   gen: number;
   rev: number;
@@ -146,6 +156,7 @@ export default {
 async function route(req: Request, env: Env, ctx: ExecutionContext, url: URL): Promise<Response> {
   if (url.pathname === "/robots.txt") return text("User-agent: *\nDisallow: /\n");
   if (env.LIST_HOST && url.host === env.LIST_HOST) return listSite(req, env, url);
+  if (env.PRIVATE_HOST && url.host === env.PRIVATE_HOST) return privateSite(req, env, ctx, url);
   if (url.pathname === "/") {
     if (!env.LIST_HOST) return notFound();
     return new Response(null, {
@@ -160,9 +171,9 @@ async function route(req: Request, env: Env, ctx: ExecutionContext, url: URL): P
     if (!env.TACK_TOKEN) return fail(503, "the TACK_TOKEN secret is not set on the Worker (run `tack setup`)");
     const token = req.headers.get("authorization")?.match(/^Bearer (.+)$/i)?.[1];
     if (!(await same(token, env.TACK_TOKEN))) return fail(401, "bad or missing token (run `tack setup`)");
-    return api(req, env, url);
+    return api(req, env, ctx, url);
   }
-  return serveDoc(req, env, ctx, url);
+  return serveDoc(req, env, ctx, url, "public");
 }
 
 async function listSite(req: Request, env: Env, url: URL): Promise<Response> {
@@ -174,15 +185,36 @@ async function listSite(req: Request, env: Env, url: URL): Promise<Response> {
     return live(env, LIST_LIVE).fetch(req);
   }
   let res: Response;
-  if (url.pathname === "/") res = (await isViewer(req, env)) ? await indexPage(env, `${url.protocol}//${env.DOCS_HOST}`) : locked();
-  else if (url.pathname === "/login") res = req.method === "POST" ? await login(req, env) : loginPage();
-  else res = notFound();
+  if (url.pathname === "/") res = (await isViewer(req, env)) ? await indexPage(env, url) : locked();
+  else if (url.pathname === "/login") {
+    res = req.method === "POST" ? await login(req, env) : loginPage(env.PRIVATE_HOST ? `${url.protocol}//${env.PRIVATE_HOST}/login` : "");
+  } else res = notFound();
+  return isolate(res, "'none'");
+}
+
+const docsOrigin = (env: Env, url: URL, isPrivate = false) =>
+  `${url.protocol}//${(isPrivate ? env.PRIVATE_HOST : env.DOCS_HOST) || url.host}`;
+
+function isolate(res: Response, frames: "'none'" | "'self'"): Response {
   res = new Response(res.body, res);
-  res.headers.set("x-frame-options", "DENY");
-  res.headers.set("content-security-policy", "frame-ancestors 'none'");
+  res.headers.set("x-frame-options", frames === "'none'" ? "DENY" : "SAMEORIGIN");
+  res.headers.set("content-security-policy", `frame-ancestors ${frames}`);
   res.headers.set("cross-origin-opener-policy", "same-origin");
   res.headers.set("cross-origin-resource-policy", "same-origin");
   return res;
+}
+
+async function privateSite(req: Request, env: Env, ctx: ExecutionContext, url: URL): Promise<Response> {
+  const site = req.headers.get("sec-fetch-site");
+  const mode = req.headers.get("sec-fetch-mode");
+  if (site && site !== "same-origin" && site !== "none" && mode !== "navigate") return fail(403, "forbidden");
+  if (url.pathname === "/login") return isolate(req.method === "POST" ? await login(req, env) : loginPage(`${url.protocol}//${env.LIST_HOST}/`), "'none'");
+  if (!(await isViewer(req, env))) return isolate(locked("This doc is private."), "'none'");
+  if (url.pathname.endsWith("/_live") && req.headers.get("origin") !== `${url.protocol}//${env.PRIVATE_HOST}`) {
+    return fail(403, "forbidden");
+  }
+  const res = await serveDoc(req, env, ctx, url, "private");
+  return res.webSocket ? res : isolate(res, "'self'");
 }
 
 async function viewKey(env: Env): Promise<string | null> {
@@ -233,29 +265,40 @@ async function same(given: string | null | undefined, expected: string): Promise
   return crypto.subtle.timingSafeEqual(a, b);
 }
 
-async function api(req: Request, env: Env, url: URL): Promise<Response> {
+async function api(req: Request, env: Env, ctx: ExecutionContext, url: URL): Promise<Response> {
   if (url.pathname === "/api/info") {
-    return json({ ok: true, listUrl: env.LIST_HOST ? `${url.protocol}//${env.LIST_HOST}` : null });
+    return json({
+      ok: true,
+      listUrl: env.LIST_HOST ? `${url.protocol}//${env.LIST_HOST}` : null,
+      privateUrl: env.PRIVATE_HOST ? `${url.protocol}//${env.PRIVATE_HOST}` : null,
+    });
+  }
+  const raw = url.pathname.match(/^\/api\/raw\/([^/]+)(\/.*)?$/);
+  if (raw) {
+    if (req.method !== "GET") return fail(405, "method not allowed");
+    const target = new URL(`/${raw[1]}${raw[2] ?? ""}`, url);
+    target.searchParams.set("raw", "1");
+    return serveDoc(new Request(target, { headers: req.headers }), env, ctx, target, "any");
   }
   const m = url.pathname.match(/^\/api\/docs(?:\/([^/]+)(?:\/(rename|v\/\d+|blobs\/[0-9a-f]{64}))?)?\/?$/);
   if (!m) return fail(404, "not found");
   const [, slug, sub] = m;
   const allow = (method: string, run: () => Promise<Response>) => (req.method === method ? run() : fail(405, "method not allowed"));
-  if (sub === "rename") return allow("POST", () => rename(req, env, url.origin, slug));
+  if (sub === "rename") return allow("POST", () => rename(req, env, url, slug));
   if (sub?.startsWith("v/")) return allow("DELETE", () => removeVersion(env, slug, Number(sub.slice(2))));
   if (sub) return allow("PUT", () => putBlob(req, env, slug, sub.slice(6)));
 
   if (!slug) {
     if (req.method !== "GET") return fail(405, "method not allowed");
     const docs = await listDocs(env);
-    return json({ ok: true, docs: docs.map((d) => ({ ...d, url: `${url.origin}/${d.slug}` })) });
+    return json({ ok: true, docs: docs.map((d) => ({ ...d, url: `${docsOrigin(env, url, d.private)}/${d.slug}` })) });
   }
   if (req.method === "GET") {
     const meta = await getMeta(env, slug);
     if (!meta) return fail(404, `no doc called "${slug}"`);
-    return json({ ok: true, url: `${url.origin}/${slug}`, ...meta });
+    return json({ ok: true, url: `${docsOrigin(env, url, meta.private)}/${slug}`, ...meta });
   }
-  if (req.method === "POST") return upload(req, env, url.origin, slug);
+  if (req.method === "POST") return upload(req, env, url, slug);
   if (req.method === "DELETE") return remove(env, slug);
   return fail(405, "method not allowed");
 }
@@ -288,7 +331,7 @@ async function putBlob(req: Request, env: Env, slug: string, hash: string): Prom
   return json({ ok: true });
 }
 
-async function upload(req: Request, env: Env, origin: string, slug: string): Promise<Response> {
+async function upload(req: Request, env: Env, url: URL, slug: string): Promise<Response> {
   if (!SLUG_RE.test(slug) || RESERVED_SLUGS.has(slug)) {
     return fail(400, "slug must be 1-64 chars of a-z, 0-9 and '-' (not starting/ending with '-'), and not 'api' or 'login'");
   }
@@ -331,7 +374,19 @@ async function upload(req: Request, env: Env, origin: string, slug: string): Pro
     if (lock) return fail(409, lock);
 
     const latest = meta.versions.at(-1);
-    if (latest && latest.hash === versionHash) return json(receipt(origin, meta, latest, true));
+    const wantPrivate = typeof body.private === "boolean" ? body.private : Boolean(meta.private);
+    if (wantPrivate && !env.PRIVATE_HOST) return fail(400, "private docs need PRIVATE_HOST set on the Worker");
+    if (latest && latest.hash === versionHash && wantPrivate === Boolean(meta.private)) {
+      return json(receipt(docsOrigin(env, url, meta.private), meta, latest, true));
+    }
+    if (latest && latest.hash === versionHash) {
+      meta.private = wantPrivate;
+      meta.rev = (meta.rev ?? 0) + 1;
+      meta.updatedAt = now;
+      if (!(await saveMeta(env, meta, { etagMatches: existing!.etag }))) continue;
+      await notify(env, slug, liveState(meta));
+      return json(receipt(docsOrigin(env, url, meta.private), meta, latest, true));
+    }
 
     const known = new Set(meta.versions.flatMap((v) => Object.values(v.files ?? {})));
     const fresh = [...new Set(Object.values(files))].filter((h) => !known.has(h) && !present.has(h));
@@ -350,11 +405,12 @@ async function upload(req: Request, env: Env, origin: string, slug: string): Pro
     delete meta.lock;
     meta.title = title || meta.title;
     meta.updatedAt = now;
+    meta.private = wantPrivate;
 
     const saved = await saveMeta(env, meta, existing ? { etagMatches: existing.etag } : new Headers({ "if-none-match": "*" }));
     if (saved) {
       await notify(env, slug, liveState(meta));
-      return json(receipt(origin, meta, version, false), existing ? 200 : 201);
+      return json(receipt(docsOrigin(env, url, meta.private), meta, version, false), existing ? 200 : 201);
     }
     if (body.create) return fail(409, `slug "${slug}" is already taken`);
   }
@@ -395,6 +451,7 @@ function receipt(origin: string, meta: Meta, v: Version, unchanged: boolean) {
     ok: true,
     slug: meta.slug,
     title: meta.title,
+    private: Boolean(meta.private),
     version: v.n,
     versions: meta.versions.length,
     unchanged,
@@ -415,6 +472,7 @@ async function saveMeta(env: Env, meta: Meta, onlyIf: R2Conditional | Headers): 
           updatedAt: meta.updatedAt,
           latest: String(meta.versions.at(-1)!.n),
           versions: String(meta.versions.length),
+          ...(meta.private && { private: "1" }),
         },
       });
     } catch (err) {
@@ -481,7 +539,7 @@ async function removeVersion(env: Env, slug: string, n: number): Promise<Respons
   return fail(503, "too many concurrent changes to this doc; retry");
 }
 
-async function rename(req: Request, env: Env, origin: string, slug: string): Promise<Response> {
+async function rename(req: Request, env: Env, url: URL, slug: string): Promise<Response> {
   const to = ((await req.json<{ to?: string }>().catch(() => null))?.to ?? "").toLowerCase();
   if (!SLUG_RE.test(to) || RESERVED_SLUGS.has(to)) return fail(400, `"${to}" isn't a valid slug`);
   const obj = SLUG_RE.test(slug) ? await env.BUCKET.get(metaKey(slug)) : null;
@@ -556,7 +614,7 @@ async function rename(req: Request, env: Env, origin: string, slug: string): Pro
   await deleteBlobs(env, slug);
   await env.BUCKET.delete(metaKey(slug));
   await notify(env, slug, { gen: meta.gen ?? 0, rev: (meta.rev ?? 0) + 1, moved: to });
-  return json({ ok: true, from: slug, slug: to, url: `${origin}/${to}` });
+  return json({ ok: true, from: slug, slug: to, url: `${docsOrigin(env, url, meta.private)}/${to}` });
 }
 
 async function getMeta(env: Env, slug: string): Promise<Meta | null> {
@@ -583,6 +641,7 @@ async function listDocs(env: Env): Promise<DocSummary[]> {
         updatedAt: m.updatedAt ?? o.uploaded.toISOString(),
         latest: Number(m.latest ?? 0),
         versions: Number(m.versions ?? 0),
+        private: m.private === "1",
       });
     }
     cursor = page.truncated ? page.cursor : undefined;
@@ -590,16 +649,18 @@ async function listDocs(env: Env): Promise<DocSummary[]> {
   return docs.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
-async function serveDoc(req: Request, env: Env, ctx: ExecutionContext, url: URL): Promise<Response> {
+async function serveDoc(req: Request, env: Env, ctx: ExecutionContext, url: URL, scope: Scope): Promise<Response> {
   const [, slug, rest] = url.pathname.match(/^\/([^/]+)(\/.*)?$/) ?? [];
   if (!slug || !SLUG_RE.test(slug)) return notFound();
+  const visible = (isPrivate: boolean) => scope === "any" || (scope === "private") === isPrivate;
   if (rest === "/_live") {
     if (req.headers.get("upgrade") !== "websocket") return fail(426, "expected a websocket");
-    if (!(await env.BUCKET.head(metaKey(slug)))) return fail(404, "not found");
+    const head = await env.BUCKET.head(metaKey(slug));
+    if (!head || !visible(head.customMetadata?.private === "1")) return fail(404, "not found");
     return live(env, slug).fetch(req);
   }
   const meta = await getMeta(env, slug);
-  if (!meta) return notFound(`No doc called “${slug}”.`);
+  if (!meta || !visible(Boolean(meta.private))) return notFound(`No doc called “${slug}”.`);
 
   const single = (v: Version) => fileCount(v) === 1;
   let sub = rest?.slice(1) ?? "";
@@ -924,14 +985,16 @@ function page(title: string, body: string, extraJs = ""): string {
 
 const time = (iso: string) => `<time datetime="${esc(iso)}">${esc(iso.slice(0, 16).replace("T", " "))}</time>`;
 
-async function indexPage(env: Env, docsOrigin: string): Promise<Response> {
+async function indexPage(env: Env, url: URL): Promise<Response> {
   const docs = await listDocs(env);
   const rows = docs
-    .map(
-      (d) =>
-        `<tr><td><a href="${esc(docsOrigin)}/${d.slug}">${esc(d.title)}</a><div class="m">${d.slug}</div></td>` +
-        `<td><a href="${esc(docsOrigin)}/${d.slug}/_history">v${d.latest}</a></td><td>${time(d.updatedAt)}</td></tr>`,
-    )
+    .map((d) => {
+      const origin = esc(docsOrigin(env, url, d.private));
+      return (
+        `<tr><td><a href="${origin}/${d.slug}">${d.private ? "🔒 " : ""}${esc(d.title)}</a><div class="m">${d.slug}</div></td>` +
+        `<td><a href="${origin}/${d.slug}/_history">v${d.latest}</a></td><td>${time(d.updatedAt)}</td></tr>`
+      );
+    })
     .join("");
   return html(
     page(
@@ -1187,21 +1250,22 @@ function decodeEntities(s: string): string {
   });
 }
 
-function loginPage(): Response {
+function loginPage(next: string): Response {
   const js = `(async () => {
   const code = location.hash.slice(1);
   history.replaceState(null, "", "/login");
   const say = (t) => (document.getElementById("s").textContent = t);
   if (!code) return say("Run tack open for an unlock link.");
   const res = await fetch("/login", { method: "POST", body: code });
-  if (res.ok) location.replace("/");
-  else say("That unlock link didn't work or has expired. Run tack open again.");
+  const next = ${JSON.stringify(next)};
+  if (!res.ok) return say("That unlock link didn't work or has expired. Run tack open again.");
+  location.replace(next.endsWith("/login") ? next + "#" + code : next || "/");
 })();`;
   return html(page("tack", `<h1>📌 tack</h1><p class="m" id="s">Unlocking…</p><script>${js}</script>`));
 }
 
-function locked(): Response {
-  return html(page("tack", `<h1>📌 tack</h1><p class="m">Locked. Run <code>tack open</code> for your unlock link.</p>`), 401);
+function locked(why = "Locked."): Response {
+  return html(page("tack", `<h1>📌 tack</h1><p class="m">${esc(why)} Run <code>tack open</code> for your unlock link.</p>`), 401);
 }
 
 function notFound(message = "Not found.", slug?: string): Response {

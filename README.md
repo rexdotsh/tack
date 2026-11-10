@@ -3,6 +3,7 @@
 An agent runs `tack upload plan.html` and replies with a link. Uploading again adds a version under the same link, and open tabs update live.
 
 - **Secret links.** Anyone with a link can read it; nobody can guess one.
+- **Private docs.** `--private` docs open only in your own browsers, on a separate host.
 - **Versions.** `/id` is the latest, `/id/v/2` is pinned, plus `/_history` and `/_diff`.
 - **Anything goes.** Served byte-for-byte: scripts, assets, multi-page folders.
 - **Free plan friendly.** One Worker, one R2 bucket, one Durable Object.
@@ -10,7 +11,7 @@ An agent runs `tack upload plan.html` and replies with a link. Uploading again a
 ## Setup
 
 1. Create an R2 bucket named `tack`.
-2. Workers & Pages → Import this repo. Deploy command `bunx wrangler deploy`, build variable `BUN_VERSION=1.4.0`. If you fork it, put your domains in `wrangler.jsonc` (`routes` and `vars`: docs on one host, the doc list on another), `DEFAULT_URL` in `cli/tack.ts` and `base` in `cli/install.sh`.
+2. Workers & Pages → Import this repo. Deploy command `bunx wrangler deploy`, build variable `BUN_VERSION=1.4.0`. If you fork it, put your domains in `wrangler.jsonc` (`routes` and `vars`: docs, the doc list and private docs each on their own host), `DEFAULT_URL` in `cli/tack.ts` and `base` in `cli/install.sh`.
 3. Install the CLI and skill (running from the repo needs Node 22.18+):
 
 ```sh
@@ -32,7 +33,7 @@ tack setup --token   # paste the token from ~/.config/tack/config.json on the fi
 ## CLI
 
 ```
-tack upload <file|dir|-> [--new] [--slug s] [--note n] [--json]
+tack upload <file|dir|-> [--new] [--slug s] [--private|--public] [--note n] [--json]
 tack get <slug|url> [--v n]
 tack list [--match words] [--json]
 tack open [slug]
@@ -45,7 +46,7 @@ tack update
 ## Dev
 
 ```sh
-printf 'TACK_TOKEN=dev\nDOCS_HOST=127.0.0.1:8787\nLIST_HOST=list.localhost:8787\n' > .dev.vars
+printf 'TACK_TOKEN=dev\nDOCS_HOST=127.0.0.1:8787\nLIST_HOST=list.localhost:8787\nPRIVATE_HOST=private.localhost:8787\n' > .dev.vars
 bun run dev
 TACK_URL=http://127.0.0.1:8787 TACK_TOKEN=dev tack upload plan.html
 ```
