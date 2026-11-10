@@ -233,7 +233,14 @@ async function get(argv: string[]) {
     return request(cfg, api.href);
   };
   const ownHost = url.origin === new URL(cfg.url).origin;
-  let res = ownHost || !cfg.token ? await request(cfg, url.href) : await viaApi();
+  const privateHost =
+    !ownHost && cfg.token
+      ? await api<{ privateUrl: string | null }>(cfg, "/api/info").then(
+          (i) => i.privateUrl !== null && new URL(i.privateUrl).origin === url.origin,
+          () => false,
+        )
+      : false;
+  let res = privateHost ? await viaApi() : await request(cfg, url.href);
   if (res.status === 404 && ownHost && cfg.token) res = await viaApi();
   if (!res.ok) throw new Error(`HTTP ${res.status} for ${url.href}`);
   const version = res.headers.get("x-tack-version");
